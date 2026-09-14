@@ -3,12 +3,15 @@ use core::mem::take;
 use hashbrown::HashMap;
 use sp1_hypercube::air::PROOF_NONCE_NUM_WORDS;
 use std::io::Write;
+use tokio::sync::watch;
 
 use sp1_primitives::consts::fd::LOWEST_ALLOWED_FD;
 
 /// The status code of the execution.
 ///
-/// Currently the only supported status codes are `0` for success and `1` for failure.
+/// Supported codes: `0` (success), `1` (panic), and `3` (invalid prover hint).
+/// Exit code 3 is emitted by patched crates when a prover-supplied hint fails
+/// verification — this disambiguates it from a regular Rust panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusCode(u32);
 
@@ -17,7 +20,11 @@ impl StatusCode {
     pub const SUCCESS: Self = Self(0);
     /// The panic status code.
     pub const PANIC: Self = Self(1);
-    /// Accept either success or panic.
+    /// The invalid-prover-hint status code. Emitted by `sp1_lib::invalid_hint!`
+    /// (and the patched crypto crates) when a hint fails its consistency
+    /// check, so a malicious prover cannot forge a regular panic.
+    pub const INVALID_HINT: Self = Self(3);
+    /// Accept any of the supported status codes.
     pub const ANY: Self = Self(u32::MAX);
 
     /// Create a new status code from a u32.
@@ -26,13 +33,14 @@ impl StatusCode {
     /// * `code` - The status code to create.
     ///
     /// # Returns
-    /// * `Some(StatusCode)` - The status code if it is valid: {0, 1}.
+    /// * `Some(StatusCode)` - The status code if it is valid: {0, 1, 3}.
     /// * `None` - The status code is not valid.
     #[must_use]
     pub const fn new(code: u32) -> Option<Self> {
         match code {
             0 => Some(Self::SUCCESS),
             1 => Some(Self::PANIC),
+            3 => Some(Self::INVALID_HINT),
             _ => None,
         }
     }
@@ -46,7 +54,7 @@ impl StatusCode {
     /// Check if the status code is equal to the given value.
     #[must_use]
     pub const fn is_accepted_code(&self, code: u32) -> bool {
-        (code == 0 || code == 1) && (self.0 == Self::ANY.0 || self.0 == code)
+        matches!(code, 0 | 1 | 3) && (self.0 == Self::ANY.0 || self.0 == code)
     }
 }
 
@@ -79,6 +87,9 @@ pub struct SP1Context<'a> {
 
     /// The IO options for the [`SP1Executor`].
     pub io_options: IoOptions<'a>,
+
+    /// Owned consumers for guest `stdout` and `stderr`.
+    pub output_consumers: OutputConsumers,
 }
 
 impl Default for SP1Context<'_> {
@@ -96,8 +107,8 @@ pub struct SP1ContextBuilder<'a> {
     calculate_gas: bool,
     expected_exit_code: Option<StatusCode>,
     proof_nonce: [u32; 4],
-    // TODO remove the lifetime here, change stdout and stderr options to accept channels.
     io_options: IoOptions<'a>,
+    output_consumers: OutputConsumers,
 }
 
 impl Default for SP1ContextBuilder<'_> {
@@ -130,6 +141,7 @@ impl<'a> SP1ContextBuilder<'a> {
             expected_exit_code: None,
             proof_nonce: [0, 0, 0, 0], // Default to zeros, will be set by SDK
             io_options: IoOptions::new(),
+            output_consumers: OutputConsumers { stdout: None, stderr: None },
         }
     }
 
@@ -174,6 +186,7 @@ impl<'a> SP1ContextBuilder<'a> {
             calculate_gas,
             proof_nonce,
             io_options: take(&mut self.io_options),
+            output_consumers: take(&mut self.output_consumers),
             expected_exit_code: self.expected_exit_code.unwrap_or(StatusCode::SUCCESS),
         }
     }
@@ -242,6 +255,22 @@ impl<'a> SP1ContextBuilder<'a> {
         self
     }
 
+    /// Publish the latest 2 KiB snapshot of guest `stdout`.
+    ///
+    /// Keep a receiver alive through execution, then clone its value after execution completes.
+    pub fn stdout_channel(&mut self, sender: watch::Sender<String>) -> &mut Self {
+        self.output_consumers.stdout = Some(sender);
+        self
+    }
+
+    /// Publish the latest 2 KiB snapshot of guest `stderr`.
+    ///
+    /// Keep a receiver alive through execution, then clone its value after execution completes.
+    pub fn stderr_channel(&mut self, sender: watch::Sender<String>) -> &mut Self {
+        self.output_consumers.stderr = Some(sender);
+        self
+    }
+
     /// Set the expected exit code of the program.
     pub fn expected_exit_code(&mut self, code: StatusCode) -> &mut Self {
         self.expected_exit_code = Some(code);
@@ -276,6 +305,7 @@ impl IoOptions<'_> {
         Self { stdout: None, stderr: None }
     }
 }
+
 impl Clone for IoOptions<'_> {
     fn clone(&self) -> Self {
         IoOptions { stdout: None, stderr: None }
@@ -289,6 +319,17 @@ pub trait IoWriter: Write + Send + Sync {}
 
 impl<W: Write + Send + Sync> IoWriter for W {}
 
+/// Publishers for the latest 2 KiB guest `stdout` and `stderr` snapshots.
+///
+/// Receivers should clone values promptly because a live borrow can delay the publisher.
+#[derive(Clone, Default)]
+pub struct OutputConsumers {
+    /// Publishes the latest retained guest `stdout`.
+    pub stdout: Option<watch::Sender<String>>,
+    /// Publishes the latest retained guest `stderr`.
+    pub stderr: Option<watch::Sender<String>>,
+}
+
 #[cfg(test)]
 mod tests {
     use crate::SP1Context;
@@ -299,6 +340,18 @@ mod tests {
             SP1Context::builder().build();
         assert!(hook_registry.is_none());
         assert!(cycle_limit.is_none());
+    }
+
+    #[test]
+    fn writer_api_remains_compatible() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut builder = SP1Context::builder();
+        builder.stdout(&mut stdout).stderr(&mut stderr);
+
+        let context = builder.build();
+        assert!(context.io_options.stdout.is_some());
+        assert!(context.io_options.stderr.is_some());
     }
 
     #[test]

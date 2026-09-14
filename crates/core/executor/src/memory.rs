@@ -1,5 +1,5 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use vec_map::VecMap;
+
 /// A memory.
 ///
 /// Consists of registers, as well as a page table for main memory.
@@ -183,17 +183,6 @@ impl<V: Copy + 'static> IntoIterator for Registers<V> {
                 .enumerate()
                 .filter_map(move |(i, v)| v.map(|v| (i as u64, v))),
         )
-    }
-}
-
-/// A page of memory.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Page<V>(VecMap<V>);
-
-impl<V> Default for Page<V> {
-    fn default() -> Self {
-        Self(VecMap::default())
     }
 }
 

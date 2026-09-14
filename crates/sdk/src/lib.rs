@@ -66,14 +66,15 @@ pub use sp1_core_executor::{ExecutionReport, HookEnv, SP1Context, SP1ContextBuil
 
 // Re-export the machine/prover primitives.
 pub use sp1_core_machine::io::SP1Stdin;
+pub use sp1_core_machine::riscv::RiscvAir;
 pub use sp1_primitives::{io::SP1PublicValues, Elf};
 pub use sp1_prover::{HashableKey, ProverMode, SP1VerifyingKey, SP1_CIRCUIT_VERSION};
 
 /// A prelude, including all the types and traits that are commonly used.
 pub mod prelude {
     pub use super::{
-        include_elf, Elf, HashableKey, ProveRequest, Prover, ProvingKey, SP1ProofWithPublicValues,
-        SP1Stdin,
+        include_elf, Elf, HashableKey, ProveRequest, Prover, ProvingKey, RiscvAir,
+        SP1ProofWithPublicValues, SP1Stdin,
     };
 }
 
@@ -105,8 +106,13 @@ mod tests {
         let elf = test_artifacts::PANIC_ELF;
         let mut stdin = SP1Stdin::new();
         stdin.write(&10usize);
-        let (_, report) = client.execute(elf, stdin).await.unwrap();
+        let (stderr_tx, stderr_rx) = tokio::sync::watch::channel(String::new());
+        let (_, report) = client.execute(elf, stdin).stderr(stderr_tx).await.unwrap();
         assert_eq!(report.exit_code, 1);
+
+        let stderr = stderr_rx.borrow().clone();
+        assert!(stderr.contains("panicked at panic/src/main.rs:9:5"), "stderr: {stderr}");
+        assert!(stderr.contains("assertion `left == right` failed"), "stderr: {stderr}");
     }
 
     // TODO: reimplement the cycle limit logic and revive this test.
@@ -212,9 +218,9 @@ mod tests {
 
         utils::setup_logger();
 
-        // Use a small chunk threshold to force multiple chunks
+        // Use a small gas chunk threshold to force multiple chunks in the gas path.
         let mut opts = SP1CoreOpts::default();
-        opts.minimal_trace_chunk_threshold = 1000;
+        opts.gas_trace_chunk_threshold = 1000;
 
         let client = MockProver::new_with_opts(opts).await;
         let elf = test_artifacts::CYCLE_TRACKER_ELF;
@@ -278,21 +284,19 @@ mod tests {
         }
     }
 
-    // TODO: reimplement the custom stdout/stderr and revive this test
-    // #[tokio::test]
-    // async fn test_e2e_io_override() {
-    //     utils::setup_logger();
-    //     let client = ProverClient::builder().cpu().build().await;
-    //     let elf = test_artifacts::HELLO_WORLD_ELF;
+    #[tokio::test]
+    async fn test_e2e_io_override() {
+        utils::setup_logger();
+        let client = ProverClient::builder().cpu().build().await;
+        let elf = test_artifacts::HELLO_WORLD_ELF;
+        let (stdout_tx, stdout_rx) = tokio::sync::watch::channel(String::new());
 
-    //     let mut stdout = Vec::new();
+        let stdin = SP1Stdin::new();
+        let _ = client.execute(elf, stdin).stdout(stdout_tx).await.unwrap();
 
-    //     // Generate proof & verify.
-    //     let stdin = SP1Stdin::new();
-    //     let _ = client.execute(elf, stdin).stdout(&mut stdout).run().unwrap();
-
-    //     assert_eq!(stdout, b"Hello, world!\n");
-    // }
+        let stdout = stdout_rx.borrow().clone();
+        assert_eq!(stdout, "Hello, world!\n");
+    }
 
     #[tokio::test]
     async fn test_e2e_compressed() {

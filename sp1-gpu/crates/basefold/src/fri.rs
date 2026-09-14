@@ -8,9 +8,7 @@ use slop_basefold_prover::{host_fold_even_odd, BasefoldProverError};
 use slop_challenger::{CanObserve, CanSampleBits, FieldChallenger, IopCtx};
 use slop_commit::{Message, Rounds};
 use slop_merkle_tree::MerkleTreeOpeningAndProof;
-use slop_multilinear::{
-    partial_lagrange_blocking, Evaluations, Mle, MleEval, MultilinearPcsChallenger, Point,
-};
+use slop_multilinear::{partial_lagrange_blocking, Mle, MultilinearPcsChallenger, Point};
 use slop_tensor::Tensor;
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
@@ -30,8 +28,8 @@ use sp1_gpu_merkle_tree::{CudaTcsProver, MerkleTreeProverData, SingleLayerMerkle
 use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle, TraceDenseData};
 
 use crate::{
-    encode_batch, CudaStackedPcsProverData, DeviceGrindingChallenger, GrindingPowCudaProver,
-    SpparkDftKoalaBear,
+    encode_batch, CudaDftKoalaBear, CudaStackedPcsProverData, DeviceGrindingChallenger,
+    GrindingPowCudaProver,
 };
 
 /// # Safety
@@ -77,27 +75,31 @@ where
     pub fn new(tcs_prover: P, config: FriConfig<GC::F>, log_height: u32) -> Self {
         Self { tcs_prover, config, log_height, _marker: PhantomData }
     }
+
     pub fn encode_and_commit(
         &self,
         use_preprocessed: bool,
         drop_traces: bool,
         jagged_trace_mle: &JaggedTraceMle<Felt, TaskScope>,
-        mut dst: Tensor<Felt, TaskScope>,
     ) -> Result<
         (<GC as IopCtx>::Digest, CudaStackedPcsProverData<GC>),
         SingleLayerMerkleTreeProverError,
     > {
-        let encoder = SpparkDftKoalaBear::default();
-
-        unsafe {
-            dst.assume_init();
-        }
+        let encoder = CudaDftKoalaBear::default();
+        let scope = jagged_trace_mle.dense().dense.backend().clone();
 
         let virtual_tensor = if use_preprocessed {
             jagged_trace_mle.preprocessed_virtual_tensor(self.log_height)
         } else {
             jagged_trace_mle.main_virtual_tensor(self.log_height)
         };
+        let sizes =
+            [virtual_tensor.sizes()[0], 1 << (self.log_height as usize + self.config.log_blowup())];
+
+        let mut dst = Tensor::<GC::F, TaskScope>::with_sizes_in(sizes, scope);
+        unsafe {
+            dst.assume_init();
+        }
 
         encode_batch(encoder, self.config.log_blowup as u32, virtual_tensor, &mut dst).unwrap();
 
@@ -117,7 +119,7 @@ where
         batching_coefficients: &Tensor<GC::EF>,
         mles: &TraceDenseData<GC::F, TaskScope>,
         codewords: Message<Tensor<Felt, TaskScope>>,
-        evaluation_claims: Vec<MleEval<GC::EF, TaskScope>>,
+        evaluation_claims: Vec<GC::EF>,
     ) -> (Mle<GC::EF, TaskScope>, Tensor<GC::F, TaskScope>, GC::EF) {
         let log_stacking_height = self.log_height;
         // Compute all the batch challenge powers.
@@ -127,9 +129,12 @@ where
         let num_variables = log_stacking_height;
         let codeword_size = (codewords.first().unwrap()).sizes()[1];
         let scope: TaskScope = mles.backend().clone();
-        let mut batch_mle =
-            Mle::new(Tensor::<GC::EF, TaskScope>::zeros_in([1, 1 << num_variables], scope.clone()));
-        let mut batch_codeword = Tensor::<GC::F, TaskScope>::zeros_in(
+        // All three buffers below are fully overwritten by the kernels, so skip the zero-init.
+        let mut batch_mle = Mle::new(Tensor::<GC::EF, TaskScope>::with_sizes_in(
+            [1, 1 << num_variables],
+            scope.clone(),
+        ));
+        let mut batch_codeword = Tensor::<GC::F, TaskScope>::with_sizes_in(
             [<GC::EF as AbstractExtensionField<GC::F>>::D, codeword_size],
             scope.clone(),
         );
@@ -148,50 +153,42 @@ where
                 (1 << num_variables) as usize,
                 batch_size
             );
+            batch_mle.assume_init();
             scope
                 .launch_kernel(TaskScope::batch_mle_kernel(), grid_dim, block_dim, &mle_args, 0)
                 .unwrap();
         }
 
-        let mut batch_coefficients = batching_coefficients.as_buffer().to_vec();
-        for codeword in codewords.iter() {
-            let batch_size = codeword.sizes()[0];
-            let mut powers = batch_coefficients;
-            batch_coefficients = powers.split_off(batch_size);
-            let powers_device = DeviceBuffer::from_host(&Buffer::from(powers.clone()), &scope)
-                .unwrap()
-                .into_inner();
-
-            let block_dim = 256;
-            let grid_dim = codeword_size.div_ceil(block_dim);
-            let codeword_args = args!(
-                codeword.as_ptr(),
-                batch_codeword.as_mut_ptr(),
-                powers_device.as_ptr(),
-                codeword_size,
-                batch_size
+        let block_dim = 256;
+        let mut batch_mle_flattened = Mle::new(Tensor::<GC::F, TaskScope>::with_sizes_in(
+            [<GC::EF as AbstractExtensionField<GC::F>>::D, 1 << num_variables],
+            scope.clone(),
+        ));
+        let grid_dim = (1usize << num_variables).div_ceil(block_dim);
+        unsafe {
+            let args = args!(
+                batch_mle.guts().as_ptr(),
+                batch_mle_flattened.guts_mut().as_mut_ptr(),
+                1usize << num_variables
             );
-            unsafe {
-                scope
-                    .launch_kernel(
-                        TaskScope::batch_rs_codeword_kernel(),
-                        grid_dim,
-                        block_dim,
-                        &codeword_args,
-                        0,
-                    )
-                    .unwrap();
-            }
+            batch_mle_flattened.assume_init();
+            batch_codeword.assume_init();
+            scope
+                .launch_kernel(TaskScope::flatten_to_base_kernel(), grid_dim, block_dim, &args, 0)
+                .unwrap();
         }
+        let encoder = CudaDftKoalaBear::default();
+        encode_batch(
+            encoder,
+            self.config.log_blowup as u32,
+            batch_mle_flattened.guts().as_view(),
+            &mut batch_codeword,
+        )
+        .unwrap();
 
         // Compute the batched evaluation claim.
         let batch_eval_claim = evaluation_claims
             .into_iter()
-            .flat_map(|batch_claims| {
-                let claims =
-                    DeviceTensor::from_raw(batch_claims.into_evaluations()).to_host().unwrap();
-                claims.into_buffer().into_vec()
-            })
             .zip(batching_coefficients.as_slice())
             .map(|(eval, coeff)| eval * *coeff)
             .sum::<GC::EF>();
@@ -282,7 +279,8 @@ where
             scope.clone(),
         );
 
-        let mut folded_codeword = Tensor::<GC::F, TaskScope>::zeros_in(
+        // Fully overwritten by `encode_batch`.
+        let mut folded_codeword = Tensor::<GC::F, TaskScope>::with_sizes_in(
             [<GC::EF as AbstractExtensionField<GC::F>>::D, folded_height << self.config.log_blowup],
             scope.clone(),
         );
@@ -297,7 +295,7 @@ where
                 .launch_kernel(TaskScope::flatten_to_base_kernel(), grid_dim, block_dim, &args, 0)
                 .unwrap();
         }
-        let encoder = SpparkDftKoalaBear::default();
+        let encoder = CudaDftKoalaBear::default();
         encode_batch(
             encoder,
             self.config.log_blowup as u32,
@@ -322,7 +320,7 @@ where
     pub fn prove_trusted_evaluations_basefold(
         &self,
         mut eval_point: Point<GC::EF>,
-        evaluation_claims: Rounds<Evaluations<GC::EF, TaskScope>>,
+        evaluation_claims: Vec<GC::EF>,
         mles: &JaggedTraceMle<GC::F, TaskScope>,
         prover_data: Rounds<&CudaStackedPcsProverData<GC>>,
         challenger: &mut GC::Challenger,
@@ -348,7 +346,7 @@ where
                     dst.assume_init();
                 }
 
-                let encoder = SpparkDftKoalaBear::default();
+                let encoder = CudaDftKoalaBear::default();
                 encode_batch(
                     encoder,
                     self.config.log_blowup as u32,
@@ -365,8 +363,6 @@ where
         let num_batching_variables = total_num_polynomials.next_power_of_two().ilog2();
 
         let encoded_messages: Message<_> = codewords.iter().cloned().collect();
-
-        let evaluation_claims = evaluation_claims.into_iter().flatten().collect::<Vec<_>>();
 
         // Grind for batch randomness.
         let batch_grinding_witness =
@@ -446,7 +442,7 @@ where
             let values = self.tcs_prover.compute_openings_at_indices(codeword, &query_indices);
             let proof = self
                 .tcs_prover
-                .prove_openings_at_indices(&data.merkle_tree_tcs_data, &query_indices)
+                .prove_openings_at_indices(&data.merkle_tree_tcs_data, codeword, &query_indices)
                 .map_err(BasefoldProverError::TcsCommitError)?;
             let opening = MerkleTreeOpeningAndProof::<GC> { values, proof };
             component_polynomials_query_openings_and_proofs.push(opening);
@@ -463,7 +459,7 @@ where
 
             let proof = self
                 .tcs_prover
-                .prove_openings_at_indices(&data, &indices)
+                .prove_openings_at_indices(&data, &leaves, &indices)
                 .map_err(BasefoldProverError::TcsCommitError)?;
             let opening = MerkleTreeOpeningAndProof { values, proof };
             query_phase_openings_and_proofs.push(opening);
@@ -515,9 +511,9 @@ mod tests {
     use slop_commit::Message;
     use slop_futures::queue::WorkerQueue;
     use slop_merkle_tree::Poseidon2KoalaBear16Prover;
-    use slop_multilinear::Mle;
+    use slop_multilinear::{Evaluations, Mle, MleEval};
     use slop_stacked::interleave_multilinears_with_fixed_rate;
-    use sp1_gpu_cudart::{run_sync_in_place, DeviceTensor, PinnedBuffer};
+    use sp1_gpu_cudart::{run_sync_in_place, PinnedBuffer};
     use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
     use sp1_gpu_tracegen::CudaTraceGenerator;
     use sp1_hypercube::prover::{ProverSemaphore, TraceGenerator};
@@ -544,12 +540,11 @@ mod tests {
             let old_prover =
                 BasefoldProver::<SP1GlobalContext, Poseidon2KoalaBear16Prover>::new(&verifier);
 
-            let new_cuda_prover = FriCudaProver::<TestGC, _, Felt> {
-                tcs_prover: Poseidon2SP1Field16CudaProver::new(&scope),
-                config: verifier.fri_config,
-                log_height: LOG_STACKING_HEIGHT,
-                _marker: PhantomData::<TestGC>,
-            };
+            let new_cuda_prover = FriCudaProver::<TestGC, _, Felt>::new(
+                Poseidon2SP1Field16CudaProver::new(&scope),
+                verifier.fri_config,
+                LOG_STACKING_HEIGHT,
+            );
 
             // Generate traces using the host tracegen.
             let semaphore = ProverSemaphore::new(1);
@@ -607,29 +602,13 @@ mod tests {
                 false,
             ));
 
-            let dst = Tensor::<Felt, TaskScope>::with_sizes_in(
-                [
-                    new_traces.0.dense().preprocessed_offset >> LOG_STACKING_HEIGHT,
-                    1 << (LOG_STACKING_HEIGHT as usize + verifier.fri_config.log_blowup()),
-                ],
-                scope.clone(),
-            );
-
             let (new_preprocessed_commit, new_preprocessed_prover_data) =
-                new_cuda_prover.encode_and_commit(true, false, &new_traces, dst).unwrap();
+                new_cuda_prover.encode_and_commit(true, false, &new_traces).unwrap();
 
             assert_eq!(new_preprocessed_commit, old_preprocessed_commitment);
 
-            let dst = Tensor::<Felt, TaskScope>::with_sizes_in(
-                [
-                    new_traces.0.dense().main_size() >> LOG_STACKING_HEIGHT,
-                    1 << (LOG_STACKING_HEIGHT as usize + verifier.fri_config.log_blowup()),
-                ],
-                scope.clone(),
-            );
-
             let (new_main_commit, new_main_prover_data) =
-                new_cuda_prover.encode_and_commit(false, false, &new_traces, dst).unwrap();
+                new_cuda_prover.encode_and_commit(false, false, &new_traces).unwrap();
             let message = old_traces
                 .main_trace_data
                 .traces
@@ -723,24 +702,12 @@ mod tests {
 
             let mut challenger = SP1GlobalContext::default_challenger();
 
-            let mut evaluation_claims_1_device = Vec::new();
-
-            for evaluation in &evaluation_claims_1.round_evaluations {
-                let eval_device =
-                    DeviceTensor::from_host(evaluation.evaluations(), &scope).unwrap().into_inner();
-                evaluation_claims_1_device.push(MleEval::new(eval_device));
-            }
-
-            let evaluation_claims_1_device =
-                Evaluations { round_evaluations: evaluation_claims_1_device };
-
-            let mut evaluation_claims_2_device = Vec::new();
-            for evaluation in &evaluation_claims_2.round_evaluations {
-                let eval_device =
-                    DeviceTensor::from_host(evaluation.evaluations(), &scope).unwrap().into_inner();
-                evaluation_claims_2_device.push(MleEval::new(eval_device));
-            }
-            let evaluation_claims_2 = Evaluations { round_evaluations: evaluation_claims_2_device };
+            let flat_evaluation_claims: Vec<Ext> = evaluation_claims_1
+                .round_evaluations
+                .iter()
+                .chain(evaluation_claims_2.round_evaluations.iter())
+                .flat_map(|mle_eval| mle_eval.iter().copied())
+                .collect();
 
             scope.synchronize_blocking().unwrap();
 
@@ -749,7 +716,7 @@ mod tests {
             let new_basefold_proof = new_cuda_prover
                 .prove_trusted_evaluations_basefold(
                     eval_point_host.clone(),
-                    [evaluation_claims_1_device, evaluation_claims_2].into_iter().collect(),
+                    flat_evaluation_claims,
                     &new_traces,
                     [&new_preprocessed_prover_data, &new_main_prover_data].into_iter().collect(),
                     &mut challenger,

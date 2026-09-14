@@ -48,6 +48,10 @@ pub struct RequestProofRequestBody {
     /// any prover can participate. Only applicable if the strategy is auction.
     #[prost(bytes = "vec", repeated, tag = "11")]
     pub whitelist: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Whether the stdin is private. When true, stdin_uri must be under
+    /// the private-stdins/ prefix and is only fetchable via GetStdinUri.
+    #[prost(bool, tag = "12")]
+    pub stdin_private: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct RequestProofResponse {
@@ -336,6 +340,10 @@ pub struct ProofRequest {
     /// The proof request error, if any.
     #[prost(enumeration = "ProofRequestError", tag = "34")]
     pub error: i32,
+    /// Whether this request's stdin is private. When true, stdin_public_uri is
+    /// empty and stdin is only fetchable via GetStdinUri by an authorized caller.
+    #[prost(bool, tag = "35")]
+    pub stdin_private: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct GetProofRequestStatusRequest {
@@ -386,6 +394,36 @@ pub struct GetProofRequestDetailsResponse {
     /// The detailed request.
     #[prost(message, optional, tag = "1")]
     pub request: ::core::option::Option<ProofRequest>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
+pub struct GetStdinUriRequest {
+    /// The message format of the body.
+    #[prost(enumeration = "MessageFormat", tag = "1")]
+    pub format: i32,
+    /// The signature of the sender.
+    #[prost(bytes = "vec", tag = "2")]
+    pub signature: ::prost::alloc::vec::Vec<u8>,
+    /// The body of the request.
+    #[prost(message, optional, tag = "3")]
+    pub body: ::core::option::Option<GetStdinUriRequestBody>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
+pub struct GetStdinUriRequestBody {
+    /// The account nonce of the sender.
+    #[prost(uint64, tag = "1")]
+    pub nonce: u64,
+    /// The identifier for the request.
+    #[prost(bytes = "vec", tag = "2")]
+    pub request_id: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
+pub struct GetStdinUriResponse {
+    /// Presigned HTTPS URL for downloading the stdin artifact.
+    #[prost(string, tag = "1")]
+    pub stdin_uri: ::prost::alloc::string::String,
+    /// Unix seconds at which the URL expires.
+    #[prost(uint64, tag = "2")]
+    pub expires_at: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct GetFilteredProofRequestsRequest {
@@ -440,6 +478,12 @@ pub struct GetFilteredProofRequestsRequest {
     /// The optional proof request error.
     #[prost(enumeration = "ProofRequestError", optional, tag = "16")]
     pub error: ::core::option::Option<i32>,
+    /// The optional boolean to filter for timed out requests.
+    #[prost(bool, optional, tag = "17")]
+    pub is_timed_out: ::core::option::Option<bool>,
+    /// The optional use mainnet flag.
+    #[prost(bool, optional, tag = "18")]
+    pub use_mainnet: ::core::option::Option<bool>,
 }
 #[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, ::prost::Message)]
 pub struct GetFilteredProofRequestsResponse {
@@ -4422,6 +4466,10 @@ pub enum FulfillmentStatus {
     Fulfilled = 3,
     /// The request cannot be fulfilled.
     Unfulfillable = 4,
+    /// The request failed during settlement. Terminal; no proof is recorded.
+    Reverted = 5,
+    /// The request expired at its deadline without a proof being submitted. Terminal.
+    Expired = 6,
 }
 impl FulfillmentStatus {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -4435,6 +4483,8 @@ impl FulfillmentStatus {
             Self::Assigned => "ASSIGNED",
             Self::Fulfilled => "FULFILLED",
             Self::Unfulfillable => "UNFULFILLABLE",
+            Self::Reverted => "REVERTED",
+            Self::Expired => "EXPIRED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -4445,6 +4495,8 @@ impl FulfillmentStatus {
             "ASSIGNED" => Some(Self::Assigned),
             "FULFILLED" => Some(Self::Fulfilled),
             "UNFULFILLABLE" => Some(Self::Unfulfillable),
+            "REVERTED" => Some(Self::Reverted),
+            "EXPIRED" => Some(Self::Expired),
             _ => None,
         }
     }
@@ -4834,6 +4886,8 @@ pub enum ExecuteFailureCause {
     Unimplemented = 7,
     /// The program ended in unconstrained mode.
     EndInUnconstrained = 8,
+    /// The execution failed with an exceeded gas limit.
+    ExceededGasLimit = 9,
 }
 impl ExecuteFailureCause {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -4851,6 +4905,7 @@ impl ExecuteFailureCause {
             Self::InvalidSyscallUsage => "INVALID_SYSCALL_USAGE",
             Self::Unimplemented => "UNIMPLEMENTED",
             Self::EndInUnconstrained => "END_IN_UNCONSTRAINED",
+            Self::ExceededGasLimit => "EXCEEDED_GAS_LIMIT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -4865,6 +4920,7 @@ impl ExecuteFailureCause {
             "INVALID_SYSCALL_USAGE" => Some(Self::InvalidSyscallUsage),
             "UNIMPLEMENTED" => Some(Self::Unimplemented),
             "END_IN_UNCONSTRAINED" => Some(Self::EndInUnconstrained),
+            "EXCEEDED_GAS_LIMIT" => Some(Self::ExceededGasLimit),
             _ => None,
         }
     }
@@ -4949,6 +5005,15 @@ pub enum ProofRequestError {
     VerificationKeyMismatch = 2,
     /// The proof request failed due to an unknown error (potentially a bug).
     UnknownFailure = 3,
+    /// The public values hash provided in the request does not match the hash from the execution
+    /// oracle.
+    PublicValuesMismatch = 4,
+    /// The proof failed verification (e.g., invalid proof, public values hash mismatch during
+    /// verification).
+    VerificationFailure = 5,
+    /// Execution succeeded but a downstream proving task (controller, shard prove,
+    /// recursion, wrap, etc.) hit a fatal error.
+    ProvingFailure = 6,
 }
 impl ProofRequestError {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -4961,6 +5026,9 @@ impl ProofRequestError {
             Self::ExecutionFailure => "EXECUTION_FAILURE",
             Self::VerificationKeyMismatch => "VERIFICATION_KEY_MISMATCH",
             Self::UnknownFailure => "UNKNOWN_FAILURE",
+            Self::PublicValuesMismatch => "PUBLIC_VALUES_MISMATCH",
+            Self::VerificationFailure => "VERIFICATION_FAILURE",
+            Self::ProvingFailure => "PROVING_FAILURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -4970,6 +5038,9 @@ impl ProofRequestError {
             "EXECUTION_FAILURE" => Some(Self::ExecutionFailure),
             "VERIFICATION_KEY_MISMATCH" => Some(Self::VerificationKeyMismatch),
             "UNKNOWN_FAILURE" => Some(Self::UnknownFailure),
+            "PUBLIC_VALUES_MISMATCH" => Some(Self::PublicValuesMismatch),
+            "VERIFICATION_FAILURE" => Some(Self::VerificationFailure),
+            "PROVING_FAILURE" => Some(Self::ProvingFailure),
             _ => None,
         }
     }

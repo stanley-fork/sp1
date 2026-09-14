@@ -82,7 +82,9 @@ pub trait HashableKey {
     /// Hash the key into a digest of u64 elements.
     fn hash_u64(&self) -> [u64; DIGEST_SIZE / 2] {
         self.hash_u32()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| chunk[0] as u64 | ((chunk[1] as u64) << 32))
             .collect::<Vec<_>>()
             .try_into()
@@ -105,13 +107,22 @@ where
     GC::Digest: Borrow<[SP1Field; DIGEST_SIZE]>,
 {
     fn hash_koalabear(&self) -> [SP1Field; DIGEST_SIZE] {
+        #[cfg(not(feature = "mprotect"))]
         let num_inputs = DIGEST_SIZE + 3 + 14 + 1;
+        #[cfg(feature = "mprotect")]
+        let num_inputs = DIGEST_SIZE + 3 + 14 + 1 + 1 + 9 + 6;
         let mut inputs = Vec::with_capacity(num_inputs);
         inputs.extend(self.preprocessed_commit.borrow());
         inputs.extend(self.pc_start);
         inputs.extend(self.initial_global_cumulative_sum.0.x.0);
         inputs.extend(self.initial_global_cumulative_sum.0.y.0);
-        inputs.push(self.enable_untrusted_programs);
+        inputs.push(self.untrusted_config.enable_untrusted_programs);
+        #[cfg(feature = "mprotect")]
+        inputs.push(self.untrusted_config.enable_trap_handler);
+        #[cfg(feature = "mprotect")]
+        inputs.extend(self.untrusted_config.trap_context.as_flattened());
+        #[cfg(feature = "mprotect")]
+        inputs.extend(self.untrusted_config.untrusted_memory.as_flattened());
 
         poseidon2_hash(inputs)
     }

@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use slop_futures::pipeline::SubmitError;
 use sp1_core_executor::SP1CoreOpts;
-use sp1_hypercube::prover::ProverSemaphore;
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::{prover::ProverSemaphore, Machine};
+use sp1_primitives::SP1Field;
 use sp1_prover_types::{Artifact, ArtifactClient};
 
 use crate::{
@@ -10,7 +12,7 @@ use crate::{
         CoreProveSubmitHandle, RawTaskRequest, RecursionVkWorker, ReduceSubmitHandle,
         SP1CoreProver, SP1CoreProverConfig, SP1DeferredProver, SP1DeferredProverConfig,
         SP1DeferredSubmitHandle, SP1RecursionProver, SP1RecursionProverConfig, SetupSubmitHandle,
-        SetupTask, TaskError, TaskId, WorkerClient,
+        SetupTask, TaskError, TaskId, TaskMetadata, WorkerClient,
     },
     SP1ProverComponents, WrapProverBuilder,
 };
@@ -59,6 +61,7 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1ProverEngine
         recursion_prover_and_permits: (Arc<C::RecursionProver>, ProverSemaphore),
         shrink_air_prover_and_permits: (Arc<C::RecursionProver>, ProverSemaphore),
         wrap_air_prover_init: WrapAirProverInit<C>,
+        machine: Machine<SP1Field, RiscvAir<SP1Field>>,
     ) -> Self {
         let recursion_prover = SP1RecursionProver::new(
             config.recursion_prover_config,
@@ -77,6 +80,7 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1ProverEngine
             core_prover_and_permits.0,
             core_prover_and_permits.1,
             recursion_prover.clone(),
+            machine,
         );
 
         let deferred_prover = SP1DeferredProver::new(
@@ -125,7 +129,10 @@ impl<A: ArtifactClient, W: WorkerClient, C: SP1ProverComponents> SP1ProverEngine
         self.deferred_prover.submit(request).await
     }
 
-    pub async fn run_shrink_wrap(&self, request: RawTaskRequest) -> Result<(), TaskError> {
+    pub async fn run_shrink_wrap(
+        &self,
+        request: RawTaskRequest,
+    ) -> Result<TaskMetadata, TaskError> {
         self.recursion_prover.run_shrink_wrap(request).await
     }
 

@@ -4,7 +4,11 @@
 
 pub mod builder;
 
+use sp1_core_executor::SP1CoreOpts;
 use sp1_core_machine::io::SP1Stdin;
+use sp1_core_machine::riscv::RiscvAir;
+use sp1_hypercube::Machine;
+use sp1_primitives::SP1Field;
 use sp1_prover::worker::{SP1LightNode, SP1NodeCore};
 
 use crate::{
@@ -24,9 +28,7 @@ pub struct LightProver {
 
 impl Default for LightProver {
     fn default() -> Self {
-        tracing::info!("initializing light prover");
-        let node = block_on(SP1LightNode::new());
-        Self { inner: node }
+        Self::new()
     }
 }
 
@@ -34,7 +36,15 @@ impl LightProver {
     /// Create a new light prover.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self::new_with_machine(RiscvAir::machine())
+    }
+
+    /// Create a new light prover with a given machine.
+    #[must_use]
+    pub fn new_with_machine(machine: Machine<SP1Field, RiscvAir<SP1Field>>) -> Self {
+        tracing::info!("initializing light prover");
+        let node = SP1LightNode::with_opts_and_machine_sync(machine, SP1CoreOpts::default());
+        Self { inner: node }
     }
 
     /// Create a light prover from an existing light node.
@@ -95,6 +105,12 @@ mod tests {
 
     use super::LightProver;
 
+    /// The blocking `LightProver` constructor must not create or `block_on` a Tokio runtime.
+    #[tokio::test]
+    async fn test_constructs_inside_tokio_runtime() {
+        let _prover = LightProver::new();
+    }
+
     /// Test that execute works and prove errors.
     #[test]
     fn test_light_execute_and_prove() {
@@ -106,7 +122,7 @@ mod tests {
         let mut stdin = SP1Stdin::new();
         stdin.write(&10usize);
         let (pv, _) = prover.execute(pk.elf.clone(), stdin).run().expect("failed to execute");
-        assert!(!pv.as_slice().is_empty());
+        assert_ne!(pv.as_slice(), &[] as &[u8]);
 
         // Prove should error.
         let mut stdin = SP1Stdin::new();

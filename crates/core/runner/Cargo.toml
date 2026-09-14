@@ -34,6 +34,7 @@ sha2 = { workspace = true }
 [dev-dependencies]
 sp1-core-machine = { workspace = true }
 test-artifacts = { path = "../../test-artifacts" }
+tokio = { workspace = true, features = ["sync"] }
 
 [lints]
 workspace = true
@@ -41,3 +42,4 @@ workspace = true
 [features]
 default = []
 profiling = ["sp1-core-executor/profiling"]
+mprotect = ["sp1-core-executor/mprotect", "sp1-core-executor-runner-binary/mprotect"]

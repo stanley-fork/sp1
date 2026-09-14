@@ -1,3 +1,4 @@
+use alloc::{sync::Arc, vec::Vec};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy)]
@@ -69,14 +70,25 @@ impl Default for Buffer {
 pub enum Elf {
     /// The ELF binary for the program.
     Static(&'static [u8]),
-    /// The ELF binary for the test program.
-    Dynamic(std::sync::Arc<[u8]>),
+    /// ELF bytes owned at runtime, read from disk or deserialized.
+    Dynamic(Arc<[u8]>),
 }
 
-// todo!(n): implement serde for the ELF type.
+impl Serialize for Elf {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        <[u8]>::serialize(self, serializer)
+    }
+}
 
-impl From<std::sync::Arc<[u8]>> for Elf {
-    fn from(elf: std::sync::Arc<[u8]>) -> Self {
+impl<'de> Deserialize<'de> for Elf {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        Ok(Self::Dynamic(bytes.into()))
+    }
+}
+
+impl From<Arc<[u8]>> for Elf {
+    fn from(elf: Arc<[u8]>) -> Self {
         Self::Dynamic(elf)
     }
 }
@@ -93,13 +105,28 @@ impl From<&[u8]> for Elf {
     }
 }
 
-impl std::ops::Deref for Elf {
+impl core::ops::Deref for Elf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Static(elf) => elf,
             Self::Dynamic(elf) => elf.as_ref(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_elf_serde_roundtrip() {
+        for elf in [Elf::Static(&[1, 2, 3]), Elf::from(alloc::vec![4, 5, 6])] {
+            let bytes = bincode::serialize(&elf).unwrap();
+            let decoded: Elf = bincode::deserialize(&bytes).unwrap();
+            assert!(matches!(decoded, Elf::Dynamic(_)), "{elf:?}");
+            assert_eq!(&*decoded, &*elf, "{elf:?}");
         }
     }
 }

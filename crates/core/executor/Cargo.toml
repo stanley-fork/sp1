@@ -34,18 +34,16 @@ num = { workspace = true }
 typenum = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 strum = { workspace = true, features = ["derive"] }
-hex = { workspace = true }
-bytemuck = { workspace = true }
 tiny-keccak = { workspace = true, features = ["keccak"] }
-vec_map = { workspace = true, features = ["serde"] }
 enum-map = { workspace = true, features = ["serde"] }
-clap = { workspace = true, features = ["derive"] }
 subenum = { workspace = true }
 serde_arrays = { workspace = true }
 deepsize2 = { workspace = true }
 memmap2 = { workspace = true }
 cfg-if = { workspace = true }
+object = { workspace = true }
 
 # profiling
 rustc-demangle = { workspace = true, optional = true }
@@ -66,6 +64,7 @@ profiling = [
   "dep:indicatif",
   "sp1-jit/profiling",
 ]
+mprotect = ["sp1-hypercube/mprotect"]
 
 [lints]
 workspace = true

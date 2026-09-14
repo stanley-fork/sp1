@@ -1,6 +1,11 @@
-use sp1_jit::SyscallContext;
+use sp1_jit::{Interrupt, SyscallContext};
 
-pub unsafe fn hint_read(ctx: &mut impl SyscallContext, ptr: u64, len: u64) -> Option<u64> {
+#[allow(clippy::unnecessary_wraps)]
+pub unsafe fn hint_read(
+    ctx: &mut impl SyscallContext,
+    ptr: u64,
+    len: u64,
+) -> Result<Option<u64>, Interrupt> {
     panic_if_input_exhausted(ctx);
 
     // SAFETY: The input stream is not empty, as checked above, so the back is not None
@@ -12,17 +17,14 @@ pub unsafe fn hint_read(ctx: &mut impl SyscallContext, ptr: u64, len: u64) -> Op
     assert_eq!(ptr % 8, 0, "hint read address not aligned to 8 bytes");
 
     // Chunk the bytes into words.
-    let chunks = vec.chunks_exact(8);
+    let (chunks, remainder) = vec.as_chunks::<8>();
     // Get the number of chunks.
     let chunk_count = chunks.len();
     // Get the remainder of the bytes.
-    let remainder = chunks.remainder();
 
     // For each chunk, write the word to the memory.
-    for (i, chunk) in chunks.enumerate() {
-        let word = u64::from_le_bytes([
-            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let word = u64::from_le_bytes(*chunk);
 
         ctx.mw_hint(ptr + (i * 8) as u64, word);
     }
@@ -35,7 +37,7 @@ pub unsafe fn hint_read(ctx: &mut impl SyscallContext, ptr: u64, len: u64) -> Op
     };
     ctx.mw_hint(ptr + (chunk_count * 8) as u64, final_word);
 
-    None
+    Ok(None)
 }
 
 unsafe fn panic_if_input_exhausted(ctx: &mut impl SyscallContext) {
@@ -45,11 +47,15 @@ unsafe fn panic_if_input_exhausted(ctx: &mut impl SyscallContext) {
 }
 
 #[allow(clippy::unnecessary_wraps)]
-pub unsafe fn hint_len(ctx: &mut impl SyscallContext, _op_a: u64, _op_b: u64) -> Option<u64> {
+pub unsafe fn hint_len(
+    ctx: &mut impl SyscallContext,
+    _op_a: u64,
+    _op_b: u64,
+) -> Result<Option<u64>, Interrupt> {
     let input_stream: &mut std::collections::VecDeque<Vec<u8>> = ctx.input_buffer();
     let value = input_stream.front().map_or(u64::MAX, |data| data.len() as u64);
 
     ctx.trace_value(value);
 
-    Some(value)
+    Ok(Some(value))
 }
