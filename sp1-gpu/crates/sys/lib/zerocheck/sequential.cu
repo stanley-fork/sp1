@@ -149,7 +149,9 @@ __global__ void zerocheck_fused_sequential(
             stc, consts, public_values, powers_of_alpha, regs, [&](LeafRef leaf) {
                 size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL)
                                   ? lay.main_ptr
-                                  : lay.preprocessed_ptr;
+                                  : (leaf.source == LEAF_SOURCE_GLOBAL_LOCAL)
+                                        ? lay.global_ptr
+                                        : lay.preprocessed_ptr;
                 return interp_load_pair(trace_data, base, leaf.col, lay.height, row_idx, e);
             });
 
@@ -160,7 +162,8 @@ __global__ void zerocheck_fused_sequential(
         // which matters for narrow widths.
         //
         // Geq correction is always out-of-band (`zerocheck_geq_corrections`).
-        if (stc.gkr_main_width != 0 || stc.gkr_prep_width != 0) {
+        if (stc.gkr_main_width != 0 || stc.gkr_prep_width != 0 ||
+            stc.gkr_global_width != 0) {
             for (uint32_t i = 0; i < stc.gkr_main_width; i++) {
                 K v = interp_load_pair(trace_data, lay.main_ptr, i, lay.height, row_idx, e);
                 acc += ext_t::load(gkr_powers, i) * v;
@@ -169,6 +172,12 @@ __global__ void zerocheck_fused_sequential(
                 K v = interp_load_pair(
                     trace_data, lay.preprocessed_ptr, i, lay.height, row_idx, e);
                 acc += ext_t::load(gkr_powers, stc.gkr_main_width + i) * v;
+            }
+            // Global columns last, in `main, prep, global` order.
+            for (uint32_t i = 0; i < stc.gkr_global_width; i++) {
+                K v = interp_load_pair(trace_data, lay.global_ptr, i, lay.height, row_idx, e);
+                acc += ext_t::load(gkr_powers,
+                                   stc.gkr_main_width + stc.gkr_prep_width + i) * v;
             }
         }
 
@@ -269,7 +278,9 @@ __global__ void zerocheck_fused_sequential_bivariate(
                 stc, consts, public_values, powers_of_alpha, regs, [&](LeafRef leaf) {
                     size_t base = (leaf.source == LEAF_SOURCE_MAIN_LOCAL)
                                       ? lay.main_ptr
-                                      : lay.preprocessed_ptr;
+                                      : (leaf.source == LEAF_SOURCE_GLOBAL_LOCAL)
+                                            ? lay.global_ptr
+                                            : lay.preprocessed_ptr;
                     return interp_load_quad(
                         trace_data, base, leaf.col, lay.height, quad_idx, full_quad, node);
                 });

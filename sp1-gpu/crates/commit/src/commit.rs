@@ -3,41 +3,41 @@ use std::{iter::once, sync::Arc};
 use slop_algebra::AbstractField;
 use slop_challenger::IopCtx;
 use slop_jagged::JaggedProverData;
+use slop_stacked::StackedProverData;
 use slop_symmetric::{CryptographicHasher, PseudoCompressionFunction as _};
 use sp1_gpu_basefold::{CudaStackedPcsProverData, FriCudaProver};
 use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_merkle_tree::{CudaTcsProver, SingleLayerMerkleTreeProverError};
-use sp1_gpu_utils::{traces::JaggedTraceMle, Ext, Felt};
+use sp1_gpu_utils::{traces::JaggedTraceMle, Ext, Felt, TraceSection};
 
-/// TODO: document
+/// Commit to one of the three trace sections (`[preprocessed | global | main]`) of the jagged
+/// trace. The section to commit is chosen by `section`.
 #[allow(clippy::type_complexity)]
 pub fn commit_multilinears<GC: IopCtx<F = Felt, EF = Ext>, P: CudaTcsProver<GC>>(
     jagged_trace_mle: &JaggedTraceMle<Felt, TaskScope>,
     max_log_row_count: u32,
-    use_preprocessed: bool,
+    section: TraceSection,
     drop_main_traces: bool,
     basefold_prover: &FriCudaProver<GC, P, Felt>,
 ) -> Result<
     (GC::Digest, JaggedProverData<GC, CudaStackedPcsProverData<GC>>),
     SingleLayerMerkleTreeProverError,
 > {
-    let (index, padding) = if use_preprocessed {
-        (
-            &jagged_trace_mle.dense().preprocessed_table_index,
-            jagged_trace_mle.dense().preprocessed_padding,
-        )
-    } else {
-        (&jagged_trace_mle.dense().main_table_index, jagged_trace_mle.dense().main_padding)
+    let dense = jagged_trace_mle.dense();
+    let (index, padding) = match section {
+        TraceSection::Preprocessed => (&dense.preprocessed_table_index, dense.preprocessed_padding),
+        TraceSection::Global => (&dense.global_table_index, dense.global_padding),
+        TraceSection::Main => (&dense.main_table_index, dense.main_padding),
     };
     let (mut row_counts, mut column_counts) = (
         index.values().map(|x| x.poly_size).collect::<Vec<_>>(),
         index.values().map(|x| x.num_polys).collect::<Vec<_>>(),
     );
 
-    let drop_traces = drop_main_traces && !use_preprocessed;
+    let drop_traces = drop_main_traces && section == TraceSection::Main;
 
     let (commitment, data) =
-        basefold_prover.encode_and_commit(use_preprocessed, drop_traces, jagged_trace_mle)?;
+        basefold_prover.encode_and_commit(section, drop_traces, jagged_trace_mle)?;
 
     let num_added_cols = padding.div_ceil(1 << max_log_row_count).max(1);
 
@@ -56,8 +56,12 @@ pub fn commit_multilinears<GC: IopCtx<F = Felt, EF = Ext>, P: CudaTcsProver<GC>>
 
     let final_commitment = compressor.compress([commitment, hash]);
 
+    // The GPU performs its own stacking on-device, so the committed data lives entirely in
+    // `CudaStackedPcsProverData`. Nest it under `StackedProverData` (the shape jagged now expects)
+    // with empty `interleaved_mles`: the GPU prove path opens via `prove_trusted_evaluations_basefold`
+    // and never drives the CPU stacked opening path that reads that field.
     let jagged_prover_data = JaggedProverData {
-        pcs_prover_data: data,
+        pcs_prover_data: StackedProverData::from_batch_data(data),
         row_counts: Arc::new(row_counts),
         column_counts: Arc::new(column_counts),
         padding_column_count: num_added_cols,
@@ -73,11 +77,11 @@ mod tests {
 
     use serial_test::serial;
     use slop_alloc::{CpuBackend, ToHost};
+    use slop_basefold_prover::BasefoldProver;
     use slop_challenger::IopCtx;
     use slop_futures::queue::WorkerQueue;
     use slop_jagged::{JaggedPcsVerifier, JaggedProver};
     use slop_merkle_tree::Poseidon2KoalaBear16Prover;
-    use slop_stacked::StackedPcsProver;
     use sp1_core_machine::io::SP1Stdin;
     use sp1_gpu_basefold::FriCudaProver;
     use sp1_gpu_cudart::{run_in_place, PinnedBuffer};
@@ -86,9 +90,9 @@ mod tests {
     };
     use sp1_gpu_jagged_tracegen::{full_tracegen, CORE_MAX_TRACE_SIZE};
     use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
-    use sp1_gpu_utils::{Felt, TestGC};
+    use sp1_gpu_utils::{Felt, TestGC, TraceSection};
     use sp1_hypercube::prover::{DefaultTraceGenerator, ProverSemaphore, TraceGenerator};
-    use sp1_hypercube::{SP1InnerPcs, SP1PcsProofInner};
+    use sp1_hypercube::SP1InnerPcs;
     use sp1_primitives::fri_params::core_fri_config;
 
     use crate::commit::commit_multilinears;
@@ -99,11 +103,7 @@ mod tests {
             tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()).await;
 
         type JC = SP1InnerPcs;
-        type Prover = JaggedProver<
-            TestGC,
-            SP1PcsProofInner,
-            StackedPcsProver<Poseidon2KoalaBear16Prover, TestGC>,
-        >;
+        type Prover = JaggedProver<TestGC, BasefoldProver<TestGC, Poseidon2KoalaBear16Prover>>;
 
         run_in_place(|scope| async move {
             let semaphore = ProverSemaphore::new(1);
@@ -147,11 +147,26 @@ mod tests {
                 main_host_values.push(mle_host);
             }
 
+            // The core machine has a global round (`MemoryLocalChip` is in every core cluster), so
+            // there must be at least one global trace to commit.
+            let mut global_host_values = Vec::new();
+            for mle in old_traces.main_trace_data.global_traces.values() {
+                let mle_host = mle.to_host().unwrap();
+                global_host_values.push(mle_host);
+            }
+            assert!(
+                !global_host_values.is_empty(),
+                "expected the core machine to have global traces"
+            );
+
             let preprocessed_message = preprocessed_host_values.into_iter().collect();
+            let global_message = global_host_values.into_iter().collect();
             let main_message = main_host_values.into_iter().collect();
 
             let (old_preprocessed_commitment, old_preprocessed_data) =
                 jagged_prover.commit_multilinears(preprocessed_message).ok().unwrap();
+            let (old_global_commitment, old_global_data) =
+                jagged_prover.commit_multilinears(global_message).ok().unwrap();
             let (old_main_commitment, old_main_data) =
                 jagged_prover.commit_multilinears(main_message).ok().unwrap();
 
@@ -180,7 +195,7 @@ mod tests {
 
             let basefold_prover = FriCudaProver::<TestGC, _, <TestGC as IopCtx>::F>::new(
                 tcs_prover,
-                jagged_verifier.pcs_verifier.basefold_verifier.fri_config,
+                jagged_verifier.stacked_pcs_verifier.inner_verifier.inner.fri_config,
                 LOG_STACKING_HEIGHT,
             );
 
@@ -188,16 +203,25 @@ mod tests {
                 commit_multilinears::<TestGC, _>(
                     &jagged_trace_data,
                     CORE_MAX_LOG_ROW_COUNT,
-                    true,
+                    TraceSection::Preprocessed,
                     false,
                     &basefold_prover,
                 )
                 .unwrap();
 
+            let (new_global_commitment, new_global_data) = commit_multilinears::<TestGC, _>(
+                &jagged_trace_data,
+                CORE_MAX_LOG_ROW_COUNT,
+                TraceSection::Global,
+                false,
+                &basefold_prover,
+            )
+            .unwrap();
+
             let (new_main_commitment, new_main_data) = commit_multilinears::<TestGC, _>(
                 &jagged_trace_data,
                 CORE_MAX_LOG_ROW_COUNT,
-                false,
+                TraceSection::Main,
                 false,
                 &basefold_prover,
             )
@@ -209,6 +233,9 @@ mod tests {
                 old_preprocessed_data.padding_column_count,
                 new_preprocessed_data.padding_column_count
             );
+            assert_eq!(old_global_data.row_counts, new_global_data.row_counts);
+            assert_eq!(old_global_data.column_counts, new_global_data.column_counts);
+            assert_eq!(old_global_data.padding_column_count, new_global_data.padding_column_count);
             assert_eq!(old_main_data.row_counts, new_main_data.row_counts);
             assert_eq!(old_main_data.column_counts, new_main_data.column_counts);
             assert_eq!(old_main_data.padding_column_count, new_main_data.padding_column_count);
@@ -216,8 +243,10 @@ mod tests {
                 old_preprocessed_data.original_commitment,
                 new_preprocessed_data.original_commitment
             );
+            assert_eq!(old_global_data.original_commitment, new_global_data.original_commitment);
             assert_eq!(old_main_data.original_commitment, new_main_data.original_commitment);
             assert_eq!(old_preprocessed_commitment, new_preprocessed_commitment);
+            assert_eq!(old_global_commitment, new_global_commitment);
             assert_eq!(old_main_commitment, new_main_commitment);
         })
         .await;

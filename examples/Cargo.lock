@@ -4012,25 +4012,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "p3-uni-stark"
-version = "0.4.3-succinct"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc3dfdeba14d8db621c4e52dd63973384ff35f353fd750154ff88397f4ea5adf"
-dependencies = [
- "itertools 0.12.1",
- "p3-air",
- "p3-challenger",
- "p3-commit",
- "p3-dft",
- "p3-field",
- "p3-matrix",
- "p3-maybe-rayon",
- "p3-util",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "p3-util"
 version = "0.4.3-succinct"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6225,6 +6206,9 @@ name = "slop-air"
 version = "6.8.0"
 dependencies = [
  "p3-air",
+ "serde",
+ "slop-algebra",
+ "slop-matrix",
 ]
 
 [[package]]
@@ -6270,6 +6254,7 @@ dependencies = [
  "slop-baby-bear",
  "slop-bn254",
  "slop-challenger",
+ "slop-commit",
  "slop-koala-bear",
  "slop-merkle-tree",
  "slop-multilinear",
@@ -6371,6 +6356,7 @@ dependencies = [
 name = "slop-jagged"
 version = "6.8.0"
 dependencies = [
+ "derive-where",
  "itertools 0.14.0",
  "num_cpus",
  "rand 0.8.5",
@@ -6493,6 +6479,7 @@ dependencies = [
  "slop-basefold-prover",
  "slop-challenger",
  "slop-commit",
+ "slop-futures",
  "slop-merkle-tree",
  "slop-multilinear",
  "slop-tensor",
@@ -6542,7 +6529,9 @@ dependencies = [
 name = "slop-uni-stark"
 version = "6.8.0"
 dependencies = [
- "p3-uni-stark",
+ "slop-air",
+ "slop-algebra",
+ "slop-matrix",
 ]
 
 [[package]]
@@ -6651,7 +6640,9 @@ dependencies = [
  "serde_json",
  "slop-air",
  "slop-algebra",
+ "slop-challenger",
  "slop-maybe-rayon",
+ "slop-merkle-tree",
  "slop-symmetric",
  "sp1-curves",
  "sp1-hypercube",
@@ -6721,6 +6712,8 @@ dependencies = [
  "slop-keccak-air",
  "slop-matrix",
  "slop-maybe-rayon",
+ "slop-merkle-tree",
+ "slop-symmetric",
  "slop-uni-stark",
  "sp1-core-executor",
  "sp1-core-executor-runner",
@@ -6797,6 +6790,7 @@ dependencies = [
  "arrayref",
  "deepsize2",
  "derive-where",
+ "futures",
  "hashbrown 0.14.5",
  "itertools 0.14.0",
  "num-bigint 0.4.6",
@@ -6809,6 +6803,7 @@ dependencies = [
  "slop-algebra",
  "slop-alloc",
  "slop-basefold",
+ "slop-basefold-prover",
  "slop-bn254",
  "slop-challenger",
  "slop-commit",
@@ -6844,6 +6839,7 @@ dependencies = [
  "libc",
  "memfd",
  "memmap2",
+ "rayon",
  "serde",
  "sp1-primitives",
  "tracing",
@@ -6898,11 +6894,14 @@ dependencies = [
  "hex",
  "indicatif",
  "itertools 0.14.0",
+ "libc",
  "lru",
  "mti",
  "num-bigint 0.4.6",
+ "num_cpus",
  "opentelemetry",
  "rand 0.8.5",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",

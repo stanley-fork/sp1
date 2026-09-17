@@ -57,6 +57,9 @@ thiserror = { workspace = true }
 lru = { workspace = true }
 eyre = { workspace = true }
 hashbrown = { workspace = true, features = ["inline-more"] }
+rayon = { workspace = true }
+num_cpus = { workspace = true }
+libc = { workspace = true }
 either = { workspace = true }
 static_assertions = { workspace = true }
 rand = { workspace = true }

@@ -3,13 +3,15 @@ use std::{marker::PhantomData, sync::Arc};
 
 use slop_algebra::{AbstractExtensionField, AbstractField, ExtensionField, TwoAdicField};
 use slop_alloc::{Buffer, HasBackend};
-use slop_basefold::{BasefoldProof, FriConfig, BATCH_GRINDING_BITS};
+use slop_basefold::{FriConfig, BATCH_GRINDING_BITS};
 use slop_basefold_prover::{host_fold_even_odd, BasefoldProverError};
 use slop_challenger::{CanObserve, CanSampleBits, FieldChallenger, IopCtx};
 use slop_commit::{Message, Rounds};
 use slop_merkle_tree::MerkleTreeOpeningAndProof;
 use slop_multilinear::{partial_lagrange_blocking, Mle, MultilinearPcsChallenger, Point};
+use slop_stacked::EqBatchedProof;
 use slop_tensor::Tensor;
+use sp1_hypercube::SP1PcsProof;
 use sp1_primitives::{SP1ExtensionField, SP1Field};
 
 use sp1_gpu_cudart::{
@@ -25,7 +27,7 @@ use sp1_gpu_cudart::{
     DeviceBuffer, DeviceMle, DeviceTensor, TaskScope,
 };
 use sp1_gpu_merkle_tree::{CudaTcsProver, MerkleTreeProverData, SingleLayerMerkleTreeProverError};
-use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle, TraceDenseData};
+use sp1_gpu_utils::{Ext, Felt, JaggedTraceMle, TraceDenseData, TraceSection};
 
 use crate::{
     encode_batch, CudaDftKoalaBear, CudaStackedPcsProverData, DeviceGrindingChallenger,
@@ -61,6 +63,14 @@ pub struct FriCudaProver<GC, P, F> {
     _marker: PhantomData<GC>,
 }
 
+type BasefoldCudaProverResult<GC> = Result<
+    EqBatchedProof<
+        SP1PcsProof<GC>,
+        <<GC as IopCtx>::Challenger as slop_challenger::GrindingChallenger>::Witness,
+    >,
+    BasefoldProverError<SingleLayerMerkleTreeProverError>,
+>;
+
 impl<GC: IopCtx<F = Felt, EF = Ext>, P> FriCudaProver<GC, P, GC::F>
 where
     GC::F: TwoAdicField,
@@ -78,7 +88,7 @@ where
 
     pub fn encode_and_commit(
         &self,
-        use_preprocessed: bool,
+        section: TraceSection,
         drop_traces: bool,
         jagged_trace_mle: &JaggedTraceMle<Felt, TaskScope>,
     ) -> Result<
@@ -88,10 +98,12 @@ where
         let encoder = CudaDftKoalaBear::default();
         let scope = jagged_trace_mle.dense().dense.backend().clone();
 
-        let virtual_tensor = if use_preprocessed {
-            jagged_trace_mle.preprocessed_virtual_tensor(self.log_height)
-        } else {
-            jagged_trace_mle.main_virtual_tensor(self.log_height)
+        let virtual_tensor = match section {
+            TraceSection::Preprocessed => {
+                jagged_trace_mle.preprocessed_virtual_tensor(self.log_height)
+            }
+            TraceSection::Global => jagged_trace_mle.global_virtual_tensor(self.log_height),
+            TraceSection::Main => jagged_trace_mle.main_virtual_tensor(self.log_height),
         };
         let sizes =
             [virtual_tensor.sizes()[0], 1 << (self.log_height as usize + self.config.log_blowup())];
@@ -324,7 +336,7 @@ where
         mles: &JaggedTraceMle<GC::F, TaskScope>,
         prover_data: Rounds<&CudaStackedPcsProverData<GC>>,
         challenger: &mut GC::Challenger,
-    ) -> Result<BasefoldProof<GC>, BasefoldProverError<SingleLayerMerkleTreeProverError>>
+    ) -> BasefoldCudaProverResult<GC>
     where
         GC::Challenger: DeviceGrindingChallenger<Witness = GC::F>,
     {
@@ -465,13 +477,15 @@ where
             query_phase_openings_and_proofs.push(opening);
         }
 
-        Ok(BasefoldProof {
-            univariate_messages,
-            fri_commitments,
-            component_polynomials_query_openings_and_proofs,
-            query_phase_openings_and_proofs,
-            final_poly,
-            pow_witness,
+        Ok(EqBatchedProof {
+            inner_proof: SP1PcsProof {
+                univariate_messages,
+                fri_commitments,
+                component_polynomials_query_openings_and_proofs,
+                query_phase_openings_and_proofs,
+                final_poly,
+                pow_witness,
+            },
             batch_grinding_witness,
         })
     }
@@ -512,7 +526,10 @@ mod tests {
     use slop_futures::queue::WorkerQueue;
     use slop_merkle_tree::Poseidon2KoalaBear16Prover;
     use slop_multilinear::{Evaluations, Mle, MleEval};
-    use slop_stacked::interleave_multilinears_with_fixed_rate;
+    use slop_stacked::{
+        interleave_multilinears_with_fixed_rate, EqBatchedEvalClaim, EqBatchedProver,
+        EqBatchedVerifier,
+    };
     use sp1_gpu_cudart::{run_sync_in_place, PinnedBuffer};
     use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
     use sp1_gpu_tracegen::CudaTraceGenerator;
@@ -536,15 +553,25 @@ mod tests {
             rt.block_on(tracegen_setup::setup(&test_artifacts::FIBONACCI_ELF, SP1Stdin::new()));
 
         run_sync_in_place(|scope| {
-            let verifier = BasefoldVerifier::<SP1GlobalContext>::new(core_fri_config(), 2);
-            let old_prover =
-                BasefoldProver::<SP1GlobalContext, Poseidon2KoalaBear16Prover>::new(&verifier);
+            let basefold_verifier = BasefoldVerifier::<SP1GlobalContext>::new(
+                core_fri_config(),
+                3,
+                LOG_STACKING_HEIGHT,
+            );
+            let old_prover = EqBatchedProver::new(
+                BasefoldProver::<SP1GlobalContext, Poseidon2KoalaBear16Prover>::new(
+                    &basefold_verifier,
+                ),
+                BATCH_GRINDING_BITS,
+            );
 
             let new_cuda_prover = FriCudaProver::<TestGC, _, Felt>::new(
                 Poseidon2SP1Field16CudaProver::new(&scope),
-                verifier.fri_config,
+                basefold_verifier.fri_config,
                 LOG_STACKING_HEIGHT,
             );
+
+            let verifier = EqBatchedVerifier::new(basefold_verifier, BATCH_GRINDING_BITS);
 
             // Generate traces using the host tracegen.
             let semaphore = ProverSemaphore::new(1);
@@ -602,13 +629,14 @@ mod tests {
                 false,
             ));
 
-            let (new_preprocessed_commit, new_preprocessed_prover_data) =
-                new_cuda_prover.encode_and_commit(true, false, &new_traces).unwrap();
+            let (new_preprocessed_commit, new_preprocessed_prover_data) = new_cuda_prover
+                .encode_and_commit(TraceSection::Preprocessed, false, &new_traces)
+                .unwrap();
 
             assert_eq!(new_preprocessed_commit, old_preprocessed_commitment);
 
             let (new_main_commit, new_main_prover_data) =
-                new_cuda_prover.encode_and_commit(false, false, &new_traces).unwrap();
+                new_cuda_prover.encode_and_commit(TraceSection::Main, false, &new_traces).unwrap();
             let message = old_traces
                 .main_trace_data
                 .traces
@@ -636,29 +664,65 @@ mod tests {
 
             assert_eq!(new_main_commit, old_main_commitment);
 
+            // Global round: sits between the preprocessed and main sections in the dense layout, so
+            // it must be opened too — otherwise the contiguous batching reads the wrong region.
+            let global_message = old_traces
+                .main_trace_data
+                .global_traces
+                .clone()
+                .into_iter()
+                .filter_map(|mle| mle.1.into_inner())
+                .map(|x| Clone::clone(x.as_ref()))
+                .collect::<Message<Mle<_, _>>>();
+
+            let mut global_host_message = Vec::new();
+            for mle in global_message.into_iter() {
+                let mle = Arc::unwrap_or_clone(mle);
+                let device_mle = sp1_gpu_cudart::DeviceMle::from(mle.into_guts());
+                global_host_message.push(device_mle.to_host().unwrap());
+            }
+            let global_host_message =
+                global_host_message.into_iter().collect::<Message<Mle<Felt, CpuBackend>>>();
+
+            let interleaved_message_global = interleave_multilinears_with_fixed_rate(
+                32,
+                global_host_message,
+                LOG_STACKING_HEIGHT,
+            );
+
+            let (old_global_commitment, old_global_prover_data) =
+                old_prover.commit_mles(interleaved_message_global.clone()).unwrap();
+
+            let (new_global_commit, new_global_prover_data) = new_cuda_prover
+                .encode_and_commit(TraceSection::Global, false, &new_traces)
+                .unwrap();
+            assert_eq!(new_global_commit, old_global_commitment);
+
             let mut rng = rand::thread_rng();
 
             let eval_point_host = Point::<Ext>::rand(&mut rng, LOG_STACKING_HEIGHT);
 
-            let evaluation_claims_1: Vec<_> = interleaved_message
-                .clone()
-                .into_iter()
-                .map(|mle| mle.eval_at(&eval_point_host))
-                .collect();
+            let evaluation_claims_1: Vec<_> =
+                interleaved_message.iter().map(|mle| mle.eval_at(&eval_point_host)).collect();
 
             let evaluation_claims_1 = Evaluations { round_evaluations: evaluation_claims_1 };
 
-            let evaluation_claims_2: Vec<_> = interleaved_message_2
-                .clone()
-                .into_iter()
+            let evaluation_claims_global: Vec<_> = interleaved_message_global
+                .iter()
                 .map(|mle| mle.eval_at(&eval_point_host))
                 .collect();
+
+            let evaluation_claims_2: Vec<_> =
+                interleaved_message_2.iter().map(|mle| mle.eval_at(&eval_point_host)).collect();
 
             let host_evaluation_claims_1: Vec<MleEval<Ext, CpuBackend>> = evaluation_claims_1
                 .round_evaluations
                 .iter()
                 .map(|mle| mle.to_host().unwrap())
                 .collect();
+
+            let host_evaluation_claims_global: Vec<MleEval<Ext, CpuBackend>> =
+                evaluation_claims_global.iter().map(|mle| mle.to_host().unwrap()).collect();
 
             let host_evaluation_claims_2: Vec<MleEval<Ext, CpuBackend>> =
                 evaluation_claims_2.iter().map(|mle| mle.to_host().unwrap()).collect();
@@ -671,6 +735,12 @@ mod tests {
                         .collect(),
                 ),
                 MleEval::new(
+                    host_evaluation_claims_global
+                        .into_iter()
+                        .flat_map(|x: MleEval<Ext, CpuBackend>| x.evaluations().storage.to_vec())
+                        .collect(),
+                ),
+                MleEval::new(
                     host_evaluation_claims_2
                         .into_iter()
                         .flat_map(|x: MleEval<Ext, CpuBackend>| x.evaluations().storage.to_vec())
@@ -678,6 +748,8 @@ mod tests {
                 ),
             ];
 
+            let evaluation_claims_global =
+                Evaluations { round_evaluations: evaluation_claims_global };
             let evaluation_claims_2 = Evaluations { round_evaluations: evaluation_claims_2 };
 
             let mut challenger = SP1GlobalContext::default_challenger();
@@ -685,14 +757,31 @@ mod tests {
             scope.synchronize_blocking().unwrap();
             let now = std::time::Instant::now();
 
+            let old_claim = EqBatchedEvalClaim {
+                point: eval_point_host.clone(),
+                // One flattened `MleEval` per committed round.
+                evaluations: vec![
+                    evaluation_claims_1.clone(),
+                    evaluation_claims_global.clone(),
+                    evaluation_claims_2.clone(),
+                ]
+                .into_iter()
+                .map(|round| round.into_iter().flatten().collect::<MleEval<_>>())
+                .collect(),
+            };
             let basefold_proof = old_prover
                 .prove_trusted_mle_evaluations(
-                    eval_point_host.clone(),
-                    vec![interleaved_message, interleaved_message_2].into_iter().collect(),
-                    vec![evaluation_claims_1.clone(), evaluation_claims_2.clone()]
+                    &old_claim,
+                    vec![interleaved_message, interleaved_message_global, interleaved_message_2]
                         .into_iter()
                         .collect(),
-                    vec![old_preprocessed_prover_data, old_main_prover_data].into_iter().collect(),
+                    vec![
+                        old_preprocessed_prover_data,
+                        old_global_prover_data,
+                        old_main_prover_data,
+                    ]
+                    .into_iter()
+                    .collect(),
                     &mut challenger,
                 )
                 .unwrap();
@@ -705,6 +794,7 @@ mod tests {
             let flat_evaluation_claims: Vec<Ext> = evaluation_claims_1
                 .round_evaluations
                 .iter()
+                .chain(evaluation_claims_global.round_evaluations.iter())
                 .chain(evaluation_claims_2.round_evaluations.iter())
                 .flat_map(|mle_eval| mle_eval.iter().copied())
                 .collect();
@@ -718,7 +808,9 @@ mod tests {
                     eval_point_host.clone(),
                     flat_evaluation_claims,
                     &new_traces,
-                    [&new_preprocessed_prover_data, &new_main_prover_data].into_iter().collect(),
+                    [&new_preprocessed_prover_data, &new_global_prover_data, &new_main_prover_data]
+                        .into_iter()
+                        .collect(),
                     &mut challenger,
                 )
                 .unwrap();
@@ -731,11 +823,15 @@ mod tests {
             // point, univariate messages, etc.) to diverge. Instead of comparing proof
             // components directly, we verify both proofs independently.
 
+            let verify_claim = EqBatchedEvalClaim {
+                point: eval_point_host.clone(),
+                // `flattened_evaluation_claims` is already one flattened `MleEval` per commitment.
+                evaluations: flattened_evaluation_claims.clone(),
+            };
             verifier
                 .verify_mle_evaluations(
-                    &[old_preprocessed_commitment, old_main_commitment],
-                    eval_point_host.clone(),
-                    &flattened_evaluation_claims,
+                    &[old_preprocessed_commitment, old_global_commitment, old_main_commitment],
+                    &verify_claim,
                     &basefold_proof,
                     &mut SP1GlobalContext::default_challenger(),
                 )
@@ -743,9 +839,8 @@ mod tests {
 
             verifier
                 .verify_mle_evaluations(
-                    &[new_preprocessed_commit, new_main_commit],
-                    eval_point_host,
-                    &flattened_evaluation_claims,
+                    &[new_preprocessed_commit, new_global_commit, new_main_commit],
+                    &verify_claim,
                     &new_basefold_proof,
                     &mut SP1GlobalContext::default_challenger(),
                 )

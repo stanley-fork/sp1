@@ -16,7 +16,7 @@ use sp1_gpu_jagged_tracegen::test_utils::tracegen_setup::{
 };
 use sp1_gpu_merkle_tree::{CudaTcsProver, Poseidon2SP1Field16CudaProver};
 use sp1_gpu_utils::config::{Felt, TestGC};
-use sp1_gpu_utils::JaggedTraceMle;
+use sp1_gpu_utils::{JaggedTraceMle, TraceSection};
 use sp1_hypercube::SP1InnerPcs;
 use sp1_primitives::fri_params::core_fri_config;
 
@@ -38,7 +38,7 @@ fn run_commit<R: Rng>(
 
     let basefold_prover = FriCudaProver::<TestGC, _, <TestGC as IopCtx>::F>::new(
         Poseidon2SP1Field16CudaProver::new(scope),
-        jagged_verifier.pcs_verifier.basefold_verifier.fri_config,
+        jagged_verifier.stacked_pcs_verifier.inner_verifier.inner.fri_config,
         LOG_STACKING_HEIGHT,
     );
 
@@ -48,7 +48,7 @@ fn run_commit<R: Rng>(
             let result = commit_multilinears::<TestGC, _>(
                 device_mle,
                 CORE_MAX_LOG_ROW_COUNT,
-                false, // use_preprocessed
+                TraceSection::Main,
                 false, // drop_main_traces
                 &basefold_prover,
             )
@@ -62,9 +62,15 @@ fn run_commit<R: Rng>(
 
 fn bench_commit(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    with_trace_source(c, &mut rng, JaggedKind, |c, id, scope, rng, device_mle| {
-        run_commit(c, id, scope, rng, &device_mle);
-    });
+    with_trace_source(
+        c,
+        &mut rng,
+        JaggedKind,
+        CORE_MAX_LOG_ROW_COUNT,
+        |c, id, scope, rng, device_mle| {
+            run_commit(c, id, scope, rng, &device_mle);
+        },
+    );
 }
 
 criterion_group!(benches, bench_commit);

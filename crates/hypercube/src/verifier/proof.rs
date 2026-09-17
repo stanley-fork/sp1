@@ -3,26 +3,26 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use slop_algebra::AbstractField;
 use slop_alloc::{CpuBackend, GLOBAL_CPU_BACKEND};
-use slop_basefold::BasefoldProof;
 use slop_challenger::{GrindingChallenger, IopCtx};
 use slop_commit::Rounds;
 use slop_jagged::{JaggedPcsProof, JaggedSumcheckEvalProof};
 use slop_matrix::dense::RowMajorMatrixView;
-use slop_multilinear::{Mle, MleEval, MultilinearPcsVerifier, Point};
+use slop_multilinear::{BatchPcsVerifier, Mle, MleEval, Point};
+use slop_stacked::{EqBatchedProof, StackedProof};
 use slop_sumcheck::PartialSumcheckProof;
 use slop_symmetric::PseudoCompressionFunction;
 use slop_tensor::Tensor;
 use sp1_primitives::{utils::reverse_bits_len, SP1ExtensionField, SP1Field, SP1GlobalContext};
 
 use crate::{
-    LogUpEvaluations, LogUpGkrOutput, LogupGkrProof, MachineVerifyingKey, SP1PcsProof,
-    SP1PcsProofInner, SP1VerifyingKey, ShardContext, DIGEST_SIZE,
+    LogUpEvaluations, LogUpGkrOutput, LogupGkrProof, MachineVerifyingKey, SP1PcsProofInner,
+    SP1VerifyingKey, ShardContext, DIGEST_SIZE,
 };
 
 /// The maximum number of elements that can be stored in the public values vec.  Both SP1 and
 /// recursive proofs need to pad their public values vec to this length.  This is required since the
 /// recursion verification program expects the public values vec to be fixed length.
-pub const PROOF_MAX_NUM_PVS: usize = 187;
+pub const PROOF_MAX_NUM_PVS: usize = 216;
 
 /// Data required for testing.
 #[derive(Clone, Serialize, Deserialize)]
@@ -47,6 +47,10 @@ pub struct TestingData<GC: IopCtx> {
 pub struct ShardProof<GC: IopCtx, Proof> {
     /// The public values
     pub public_values: Vec<GC::F>,
+    /// The commitment to the global traces. `Some` iff the machine has a global round.
+    pub global_commitment: Option<GC::Digest>,
+    /// The global cumulative sum exposed by the shard.
+    pub global_cumulative_sum: Option<GC::EF>,
     /// The commitments to main traces.
     pub main_commitment: GC::Digest,
     /// The Logup GKR IOP proof.
@@ -61,7 +65,7 @@ pub struct ShardProof<GC: IopCtx, Proof> {
 
 /// The `ShardProof` type generic in `GC` and `SC`.
 pub type ShardContextProof<GC, SC> =
-    ShardProof<GC, <<SC as ShardContext<GC>>::Config as MultilinearPcsVerifier<GC>>::Proof>;
+    ShardProof<GC, <<SC as ShardContext<GC>>::Config as BatchPcsVerifier<GC>>::Proof>;
 
 /// The values of the chips in the shard at a random point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +82,8 @@ pub struct ShardOpenedValues<F, EF> {
 pub struct ChipOpenedValues<F, EF> {
     /// The opening of the preprocessed trace.
     pub preprocessed: AirOpenedValues<EF>,
+    /// The opening of the global trace.
+    pub global: AirOpenedValues<EF>,
     /// The opening of the main trace.
     pub main: AirOpenedValues<EF>,
     /// The big-endian bit representation of the degree of the chip.
@@ -195,26 +201,30 @@ pub fn create_dummy_recursion_proof(
 
     // Create dummy basefold proof.
     let dummy_query_proof = Vec::new();
-    let basefold_proof = BasefoldProof::<SP1GlobalContext> {
+    let basefold_proof = SP1PcsProofInner {
         univariate_messages: vec![],
         fri_commitments: vec![],
         final_poly: SP1ExtensionField::zero(),
         pow_witness: SP1Field::zero(),
-        batch_grinding_witness: SP1Field::zero(),
         component_polynomials_query_openings_and_proofs: vec![],
         query_phase_openings_and_proofs: dummy_query_proof,
     };
+    let inner_proof =
+        EqBatchedProof { inner_proof: basefold_proof, batch_grinding_witness: SP1Field::zero() };
 
     let batch_evaluations: Rounds<MleEval<SP1ExtensionField, CpuBackend>> = Rounds::default();
 
-    let stacked_proof = SP1PcsProof { basefold_proof, batch_evaluations };
+    let stacked_proof = StackedProof { inner_proof, batch_evaluations };
 
-    let jagged_eval_proof =
-        JaggedSumcheckEvalProof { partial_sumcheck_proof: PartialSumcheckProof::dummy() };
+    let jagged_eval_proof = JaggedSumcheckEvalProof {
+        partial_sumcheck_proof: PartialSumcheckProof::dummy(),
+        two_stage_proof: slop_jagged::TwoStageEqProductProof::dummy(),
+    };
 
     let evaluation_proof = JaggedPcsProof {
         pcs_proof: stacked_proof,
         jagged_eval_proof,
+        boolean_batched_proof: slop_jagged::BooleanityBatchedProof::dummy(1),
         sumcheck_proof: PartialSumcheckProof::dummy(),
         merkle_tree_commitments: Rounds::default(),
         row_counts_and_column_counts: Rounds::default(),
@@ -232,6 +242,7 @@ pub fn create_dummy_recursion_proof(
             numerator: Mle::new(empty_tensor.clone()),
             denominator: Mle::new(empty_tensor),
         },
+        global_interaction_outputs: vec![],
         round_proofs: vec![],
         logup_evaluations: LogUpEvaluations {
             point: Point::from_usize(0, 1),
@@ -243,6 +254,8 @@ pub fn create_dummy_recursion_proof(
     // Create dummy ShardProof.
     let dummy_shard_proof = ShardProof {
         public_values: Vec::new(),
+        global_commitment: None,
+        global_cumulative_sum: None,
         main_commitment: [SP1Field::zero(); DIGEST_SIZE],
         logup_gkr_proof,
         zerocheck_proof: PartialSumcheckProof::dummy(),

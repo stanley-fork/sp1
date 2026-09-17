@@ -1,13 +1,9 @@
 use derive_where::derive_where;
-use slop_basefold::FriConfig;
-use slop_merkle_tree::MerkleTreeTcs;
-#[allow(clippy::disallowed_types)]
-use slop_stacked::{StackedBasefoldProof, StackedPcsVerifier};
-use slop_whir::{Verifier, WhirProofShape};
+use slop_basefold::{BasefoldVerifier, FriConfig};
 use sp1_primitives::{SP1GlobalContext, SP1OuterGlobalContext};
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet},
-    iter::once,
     marker::PhantomData,
     ops::Deref,
 };
@@ -19,30 +15,32 @@ use slop_challenger::{CanObserve, FieldChallenger, IopCtx, VariableLengthChallen
 use slop_commit::Rounds;
 use slop_jagged::{JaggedPcsVerifier, JaggedPcsVerifierError};
 use slop_matrix::dense::RowMajorMatrixView;
-use slop_multilinear::{full_geq, Evaluations, Mle, MleEval, MultilinearPcsVerifier};
+use slop_multilinear::{full_geq, BatchPcsVerifier, Evaluations, Mle, MleEval};
 use slop_sumcheck::{partially_verify_sumcheck_proof, SumcheckError};
 use thiserror::Error;
 
 use crate::{
-    air::MachineAir,
-    prover::{CoreProofShape, PcsProof, ZerocheckAir},
-    Chip, ChipOpenedValues, LogUpEvaluations, LogUpGkrVerifier, LogupGkrVerificationError, Machine,
-    ShardContext, ShardContextImpl, VerifierConstraintFolder, MAX_CONSTRAINT_DEGREE,
-    PROOF_MAX_NUM_PVS, SP1SC,
+    air::{InteractionScope, MachineAir, PublicValues},
+    beta_seed_dim_for_scope, observe_global_challenge,
+    prover::{CoreProofShape, PcsProof, Record, ZerocheckAir},
+    pv_interaction_max_arity, Chip, ChipOpenedValues, LogUpEvaluations, LogUpGkrVerifier,
+    LogupGkrVerificationError, Machine, ShardContext, VerifierConstraintFolder,
+    MAX_CONSTRAINT_DEGREE, PROOF_MAX_NUM_PVS, SP1SC,
 };
 
 use super::{MachineVerifyingKey, ShardOpenedValues, ShardProof};
 
-/// The number of commitments in an SP1 shard proof, corresponding to the preprocessed and main
-/// commitments.
+/// The number of commitments in a 2-round (recursion) SP1 shard proof, corresponding to the
+/// preprocessed and main commitments. Machines with a global round have 3 commitments; use
+/// [`Machine::num_commitment_rounds`] to derive the count from the machine.
 pub const NUM_SP1_COMMITMENTS: usize = 2;
 
 /// The number of bits to grind in sampling the GKR randomness.
 pub const GKR_GRINDING_BITS: usize = 12;
 
-#[allow(clippy::disallowed_types)]
-/// The Multilinear PCS used in SP1 shard proofs, generic in the `IopCtx`.
-pub type SP1Pcs<GC> = StackedPcsVerifier<GC>;
+/// The Multilinear PCS used in SP1 shard proofs, generic in the `IopCtx`. Jagged wraps this base
+/// (batch) PCS verifier in its own stacking layer internally.
+pub type SP1Pcs<GC> = BasefoldVerifier<GC>;
 
 /// The PCS used for all stages of SP1 proving except for wrap.
 pub type SP1InnerPcs = SP1Pcs<SP1GlobalContext>;
@@ -50,9 +48,14 @@ pub type SP1InnerPcs = SP1Pcs<SP1GlobalContext>;
 /// The PCS used for wrap proving.
 pub type SP1OuterPcs = SP1Pcs<SP1OuterGlobalContext>;
 
-/// The PCS proof type used in SP1 shard proofs.
+/// The PCS proof type used in SP1 shard proofs: the base (batch) PCS proof that the jagged proof
+/// wraps. Jagged's internal stacking proof is nested inside [`slop_jagged::JaggedPcsProof`].
+///
+/// This alias is the single place SP1 pins its concrete base-PCS proof to Basefold; the rest of
+/// the codebase names `SP1PcsProof` so swapping the PCS here propagates automatically. Hence the
+/// `disallowed_types` allow: this definition is the sanctioned home for `BasefoldProof`.
 #[allow(clippy::disallowed_types)]
-pub type SP1PcsProof<GC> = StackedBasefoldProof<GC>;
+pub type SP1PcsProof<GC> = slop_basefold::BasefoldProof<GC>;
 
 /// The proof type for all stages of SP1 proving except for wrap.
 pub type SP1PcsProofInner = SP1PcsProof<SP1GlobalContext>;
@@ -119,7 +122,10 @@ pub enum ShardVerifierError<EF, PcsError> {
 
 /// Derive the error type from the jagged config.
 pub type ShardVerifierConfigError<GC, C> =
-    ShardVerifierError<<GC as IopCtx>::EF, <C as MultilinearPcsVerifier<GC>>::VerifierError>;
+    ShardVerifierError<<GC as IopCtx>::EF, <C as BatchPcsVerifier<GC>>::VerifierError>;
+
+/// A selector for one trace group's openings within a chip's opened values.
+type OpeningGroupFn<F, EF> = fn(&ChipOpenedValues<F, EF>) -> &[EF];
 
 /// An error that occurs when the shape of the openings does not match the expected shape.
 #[derive(Debug, Error)]
@@ -127,6 +133,9 @@ pub enum OpeningShapeError {
     /// The width of the preprocessed trace does not match the expected width.
     #[error("preprocessed width mismatch: {0} != {1}")]
     PreprocessedWidthMismatch(usize, usize),
+    /// The width of the global trace does not match the expected width.
+    #[error("global width mismatch: {0} != {1}")]
+    GlobalWidthMismatch(usize, usize),
     /// The width of the main trace does not match the expected width.
     #[error("main width mismatch: {0} != {1}")]
     MainWidthMismatch(usize, usize),
@@ -159,7 +168,7 @@ impl<GC: IopCtx, SC: ShardContext<GC>> ShardVerifier<GC, SC> {
     #[must_use]
     #[inline]
     pub fn log_stacking_height(&self) -> u32 {
-        <SC::Config>::log_stacking_height(&self.jagged_pcs_verifier.pcs_verifier)
+        self.jagged_pcs_verifier.stacked_pcs_verifier.log_stacking_height()
     }
 
     /// Get a new challenger.
@@ -189,8 +198,6 @@ impl<GC: IopCtx, SC: ShardContext<GC>> ShardVerifier<GC, SC> {
             .iter()
             .map(|rc_cc| rc_cc.iter().map(|(r, c)| r * c).sum::<usize>())
             .collect::<Vec<_>>();
-        let preprocessed_area = areas[0];
-        let main_area = areas[1];
 
         let added_columns: Vec<usize> = proof
             .evaluation_proof
@@ -199,12 +206,24 @@ impl<GC: IopCtx, SC: ShardContext<GC>> ShardVerifier<GC, SC> {
             .map(|cc| cc[cc.len() - 2].1 + 1)
             .collect();
 
+        // The rounds are ordered `[preprocessed, global, main]` for machines with a global
+        // round, `[preprocessed, main]` otherwise.
+        let preprocessed_area = areas[0];
+        let (global_area, main_area, global_padding_cols, main_padding_cols) =
+            if self.machine.has_global_round() {
+                (areas[1], areas[2], added_columns[1], added_columns[2])
+            } else {
+                (0, areas[1], 0, added_columns[1])
+            };
+
         CoreProofShape {
             shard_chips,
             preprocessed_area,
+            global_area,
             main_area,
             preprocessed_padding_cols: added_columns[0],
-            main_padding_cols: added_columns[1],
+            global_padding_cols,
+            main_padding_cols,
         }
     }
 
@@ -216,10 +235,12 @@ impl<GC: IopCtx, SC: ShardContext<GC>> ShardVerifier<GC, SC> {
     ) -> GC::EF
 where {
         let dummy_preprocessed_trace = vec![GC::EF::zero(); chip.preprocessed_width()];
+        let dummy_global_trace = vec![GC::EF::zero(); chip.global_width()];
         let dummy_main_trace = vec![GC::EF::zero(); chip.width()];
 
         let mut folder = VerifierConstraintFolder::<GC::F, GC::EF> {
             preprocessed: RowMajorMatrixView::new_row(&dummy_preprocessed_trace),
+            global: RowMajorMatrixView::new_row(&dummy_global_trace),
             main: RowMajorMatrixView::new_row(&dummy_main_trace),
             alpha,
             accumulator: GC::EF::zero(),
@@ -242,6 +263,7 @@ where {
 where {
         let mut folder = VerifierConstraintFolder::<GC::F, GC::EF> {
             preprocessed: RowMajorMatrixView::new_row(&opening.preprocessed.local),
+            global: RowMajorMatrixView::new_row(&opening.global.local),
             main: RowMajorMatrixView::new_row(&opening.main.local),
             alpha,
             accumulator: GC::EF::zero(),
@@ -263,6 +285,14 @@ where {
             return Err(OpeningShapeError::PreprocessedWidthMismatch(
                 chip.preprocessed_width(),
                 opening.preprocessed.local.len(),
+            ));
+        }
+
+        // Verify that the global width matches the expected value for the chip.
+        if opening.global.local.len() != chip.global_width() {
+            return Err(OpeningShapeError::GlobalWidthMismatch(
+                chip.global_width(),
+                opening.global.local.len(),
             ));
         }
 
@@ -293,10 +323,7 @@ where
         proof: &ShardProof<GC, PcsProof<GC, SC>>,
         public_values: &[GC::F],
         challenger: &mut GC::Challenger,
-    ) -> Result<
-        (),
-        ShardVerifierError<GC::EF, <SC::Config as MultilinearPcsVerifier<GC>>::VerifierError>,
-    >
+    ) -> Result<(), ShardVerifierError<GC::EF, <SC::Config as BatchPcsVerifier<GC>>::VerifierError>>
 where {
         let max_log_row_count = self.jagged_pcs_verifier.max_log_row_count;
 
@@ -349,11 +376,13 @@ where {
             let constraint_eval = Self::eval_constraints(chip, openings, alpha, public_values)
                 - padded_row_adjustment * geq_val;
 
+            // The GKR opening batch is ordered `main, prep, global`.
             let openings_batch = openings
                 .main
                 .local
                 .iter()
                 .chain(openings.preprocessed.local.iter())
+                .chain(openings.global.local.iter())
                 .copied()
                 .zip(gkr_batch_open_challenge.powers().skip(1))
                 .map(|(opening, power)| opening * power)
@@ -366,10 +395,11 @@ where {
         if proof.zerocheck_proof.point_and_eval.1 != rlc_eval {
             return Err(ShardVerifierError::<
                 _,
-                <SC::Config as MultilinearPcsVerifier<GC>>::VerifierError,
+                <SC::Config as BatchPcsVerifier<GC>>::VerifierError,
             >::ConstraintsCheckFailed(SumcheckError::InconsistencyWithEval));
         }
 
+        // The GKR opening batch is ordered `main, prep, global`.
         let zerocheck_sum_modifications_from_gkr = gkr_evaluations
             .chip_openings
             .values()
@@ -379,13 +409,8 @@ where {
                     .deref()
                     .iter()
                     .copied()
-                    .chain(
-                        chip_evaluation
-                            .preprocessed_trace_evaluations
-                            .as_ref()
-                            .iter()
-                            .flat_map(|&evals| evals.deref().iter().copied()),
-                    )
+                    .chain(chip_evaluation.preprocessed_trace_evaluations.deref().iter().copied())
+                    .chain(chip_evaluation.global_trace_evaluations.deref().iter().copied())
                     .zip(gkr_batch_open_challenge.powers().skip(1))
                     .map(|(opening, power)| opening * power)
                     .sum::<GC::EF>()
@@ -401,7 +426,7 @@ where {
         if proof.zerocheck_proof.claimed_sum != zerocheck_sum_modification {
             return Err(ShardVerifierError::<
                 _,
-                <SC::Config as MultilinearPcsVerifier<GC>>::VerifierError,
+                <SC::Config as BatchPcsVerifier<GC>>::VerifierError,
             >::ConstraintsCheckFailed(
                 SumcheckError::InconsistencyWithClaimedSum
             ));
@@ -417,23 +442,27 @@ where {
         .map_err(|e| {
             ShardVerifierError::<
                 _,
-                <SC::Config as MultilinearPcsVerifier<GC>>::VerifierError,
+                <SC::Config as BatchPcsVerifier<GC>>::VerifierError,
             >::ConstraintsCheckFailed(e)
         })?;
 
-        // Observe the openings
+        // Observe the openings. The global openings are only observed on machines with a global
+        // round, keeping 2-round (recursion) machine transcripts unchanged.
+        let has_global_round = self.machine.has_global_round();
         let len = shard_chips.len();
         challenger.observe(GC::F::from_canonical_usize(len));
         for opening in opened_values.chips.values() {
             challenger.observe_variable_length_extension_slice(&opening.preprocessed.local);
+            if has_global_round {
+                challenger.observe_variable_length_extension_slice(&opening.global.local);
+            }
             challenger.observe_variable_length_extension_slice(&opening.main.local);
         }
 
         Ok(())
     }
 
-    /// Verify a shard proof.
-    #[allow(clippy::too_many_lines)]
+    /// Verify a shard proof with no chunk context.
     pub fn verify_shard(
         &self,
         vk: &MachineVerifyingKey<GC>,
@@ -441,7 +470,22 @@ where {
         challenger: &mut GC::Challenger,
     ) -> Result<(), ShardVerifierConfigError<GC, SC::Config>>
 where {
+        self.verify_shard_with_global_commitments(vk, proof, None, challenger)
+    }
+
+    /// Verify a shard proof.
+    #[allow(clippy::too_many_lines)]
+    pub fn verify_shard_with_global_commitments(
+        &self,
+        vk: &MachineVerifyingKey<GC>,
+        proof: &ShardProof<GC, PcsProof<GC, SC>>,
+        global_commitments: Option<&[GC::Digest]>,
+        challenger: &mut GC::Challenger,
+    ) -> Result<(), ShardVerifierConfigError<GC, SC::Config>>
+where {
         let ShardProof {
+            global_commitment,
+            global_cumulative_sum,
             main_commitment,
             opened_values,
             evaluation_proof,
@@ -464,7 +508,31 @@ where {
         }
         let shard_chips = opened_values.chips.keys().cloned().collect::<BTreeSet<_>>();
 
-        // Observe the public values.
+        let has_global_round = self.machine.has_global_round();
+        let num_commitment_rounds = self.machine.num_commitment_rounds();
+        if global_commitment.is_some() != has_global_round
+            || global_cumulative_sum.is_some() != has_global_round
+            || evaluation_proof.row_counts_and_column_counts.len() != num_commitment_rounds
+        {
+            return Err(ShardVerifierError::InvalidShape);
+        }
+
+        // On a machine with a global round, observe the necessary public values.
+        if has_global_round {
+            let pv: &PublicValues<[_; 4], [_; 3], [_; 4], _> = public_values.as_slice().borrow();
+            challenger.observe_constant_length_extension_slice(&pv.prev_merkle_root);
+            challenger.observe_constant_length_extension_slice(&pv.merkle_root);
+        }
+        // Derive the chunk's shared global challenge pair.
+        let global_challenges = has_global_round.then(|| {
+            let beta_seed_dim = beta_seed_dim_for_scope(
+                self.machine.chips().iter(),
+                InteractionScope::Global,
+                pv_interaction_max_arity::<Record<GC, SC>>(),
+            );
+            observe_global_challenge::<GC>(global_commitments, beta_seed_dim, challenger)
+        });
+        // Observe the full public values.
         challenger.observe_constant_length_extension_slice(public_values);
         // Observe the main commitment.
         challenger.observe(*main_commitment);
@@ -569,12 +637,13 @@ where {
                 ));
             }
 
-            if gkr_opened_values
-                .preprocessed_trace_evaluations
-                .as_ref()
-                .map_or(0, MleEval::num_polynomials)
+            if gkr_opened_values.preprocessed_trace_evaluations.len()
                 != shard_chip.preprocessed_width()
             {
+                return Err(ShardVerifierError::InvalidShape);
+            }
+
+            if gkr_opened_values.global_trace_evaluations.len() != shard_chip.global_width() {
                 return Err(ShardVerifierError::InvalidShape);
             }
 
@@ -588,6 +657,8 @@ where {
             &shard_chips,
             &degrees,
             max_log_row_count,
+            global_challenges.as_ref(),
+            *global_cumulative_sum,
             logup_gkr_proof,
             public_values,
             challenger,
@@ -604,40 +675,33 @@ where {
             challenger,
         )?;
 
-        // Verify the opening proof.
-        // `preprocessed_openings_for_proof` is `Vec` of preprocessed `AirOpenedValues` of chips.
-        // `main_openings_for_proof` is `Vec` of main `AirOpenedValues` of chips.
-        let (preprocessed_openings_for_proof, main_openings_for_proof): (Vec<_>, Vec<_>) = proof
-            .opened_values
-            .chips
-            .values()
-            .map(|opening| (opening.preprocessed.clone(), opening.main.clone()))
-            .unzip();
+        // Verify the opening proof. Each committed round contains one matrix per chip group with
+        // nonzero width, in chip (name) order — so empty openings are skipped per round.
+        let collect_round = |group: OpeningGroupFn<GC::F, GC::EF>| {
+            proof
+                .opened_values
+                .chips
+                .values()
+                .map(group)
+                .filter(|x| !x.is_empty())
+                .map(|x| x.iter().copied().collect::<MleEval<_>>())
+                .collect::<Evaluations<_>>()
+        };
 
-        // `preprocessed_openings` is the `Vec` of preprocessed openings of all chips.
-        let preprocessed_openings = preprocessed_openings_for_proof
-            .iter()
-            .map(|x| x.local.iter().as_slice())
-            .collect::<Vec<_>>();
+        let preprocessed_openings = collect_round(|opening| &opening.preprocessed.local);
+        let global_openings = collect_round(|opening| &opening.global.local);
+        let main_openings = collect_round(|opening| &opening.main.local);
 
-        // `main_openings` is the `Evaluations` derived by collecting all the main openings.
-        let main_openings = main_openings_for_proof
-            .iter()
-            .map(|x| x.local.iter().copied().collect::<MleEval<_>>())
-            .collect::<Evaluations<_>>();
-
-        // `filtered_preprocessed_openings` is the `Evaluations` derived by collecting all the
-        // non-empty preprocessed openings.
-        let filtered_preprocessed_openings = preprocessed_openings
-            .into_iter()
-            .filter(|x| !x.is_empty())
-            .map(|x| x.iter().copied().collect::<MleEval<_>>())
-            .collect::<Evaluations<_>>();
-
-        let (commitments, openings) = (
-            vec![vk.preprocessed_commit, *main_commitment],
-            Rounds { rounds: vec![filtered_preprocessed_openings, main_openings] },
-        );
+        // The rounds are ordered `[preprocessed, global, main]`.
+        let mut commitments = vec![vk.preprocessed_commit];
+        let mut rounds = vec![preprocessed_openings];
+        if let Some(global_commitment) = global_commitment {
+            commitments.push(*global_commitment);
+            rounds.push(global_openings);
+        }
+        commitments.push(*main_commitment);
+        rounds.push(main_openings);
+        let openings = Rounds { rounds };
 
         let flattened_openings = openings
             .into_iter()
@@ -659,49 +723,52 @@ where {
             )
             .map_err(ShardVerifierError::InvalidopeningArgument)?;
 
-        let [mut preprocessed_row_counts, mut main_row_counts]: [Vec<usize>; 2] = proof
+        // The per-round row counts from the jagged proof, in round order
+        // (`[preprocessed, global, main]` or `[preprocessed, main]`).
+        let round_row_counts: Vec<Vec<usize>> = proof
             .evaluation_proof
             .row_counts_and_column_counts
             .clone()
             .into_iter()
-            .map(|r_c| r_c.into_iter().map(|(r, _)| r).collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
-
-        // Remove the last two row row counts because we add the padding columns as two extra
-        // tables.
-        for _ in 0..2 {
-            preprocessed_row_counts.pop();
-            main_row_counts.pop();
-        }
+            .map(|r_c| {
+                let mut row_counts = r_c.into_iter().map(|(r, _)| r).collect::<Vec<_>>();
+                // Remove the last two row counts: we add the padding columns as two extra tables.
+                row_counts.pop();
+                row_counts.pop();
+                row_counts
+            })
+            .collect::<Vec<_>>();
 
         let mut preprocessed_chip_degrees = vec![];
+        let mut global_chip_degrees = vec![];
         let mut main_chip_degrees = vec![];
 
         for chip in shard_chips.iter() {
+            let degree = proof.opened_values.chips[chip.name()]
+                .degree
+                .bit_string_evaluation()
+                .as_canonical_u32();
             if chip.preprocessed_width() > 0 {
-                preprocessed_chip_degrees.push(
-                    proof.opened_values.chips[chip.name()]
-                        .degree
-                        .bit_string_evaluation()
-                        .as_canonical_u32(),
-                );
+                preprocessed_chip_degrees.push(degree);
             }
-            main_chip_degrees.push(
-                proof.opened_values.chips[chip.name()]
-                    .degree
-                    .bit_string_evaluation()
-                    .as_canonical_u32(),
-            );
+            if chip.global_width() > 0 {
+                global_chip_degrees.push(degree);
+            }
+            if chip.width() > 0 {
+                main_chip_degrees.push(degree);
+            }
         }
+
+        let round_chip_degrees = if has_global_round {
+            vec![preprocessed_chip_degrees, global_chip_degrees, main_chip_degrees]
+        } else {
+            vec![preprocessed_chip_degrees, main_chip_degrees]
+        };
 
         // Check that the row counts in the jagged proof match the chip degrees in the
         // `ChipOpenedValues` struct.
         for (chip_opening_row_counts, proof_row_counts) in
-            [preprocessed_chip_degrees, main_chip_degrees]
-                .iter()
-                .zip_eq([preprocessed_row_counts, main_row_counts].iter())
+            round_chip_degrees.iter().zip_eq(round_row_counts.iter())
         {
             if proof_row_counts.len() != chip_opening_row_counts.len() {
                 return Err(ShardVerifierError::InvalidShape);
@@ -713,6 +780,26 @@ where {
             }
         }
 
+        // The expected column counts per round: one entry per chip group with nonzero width.
+        let preprocessed_widths = shard_chips
+            .iter()
+            .map(MachineAir::<GC::F>::preprocessed_width)
+            .filter(|&width| width > 0)
+            .collect::<Vec<_>>();
+        let global_widths = shard_chips
+            .iter()
+            .map(MachineAir::<GC::F>::global_width)
+            .filter(|&width| width > 0)
+            .collect::<Vec<_>>();
+        let main_widths =
+            shard_chips.iter().map(Chip::width).filter(|&width| width > 0).collect::<Vec<_>>();
+
+        let round_widths = if has_global_round {
+            vec![preprocessed_widths, global_widths, main_widths]
+        } else {
+            vec![preprocessed_widths, main_widths]
+        };
+
         // Check that the shape of the proof struct column counts matches the shape of the shard
         // chips. In the future, we may allow for a layer of abstraction where the proof row
         // counts and column counts can be separate from the machine chips (e.g. if two
@@ -723,16 +810,7 @@ where {
             .row_counts_and_column_counts
             .iter()
             .cloned()
-            .zip(
-                once(
-                    shard_chips
-                        .iter()
-                        .map(MachineAir::<GC::F>::preprocessed_width)
-                        .filter(|&width| width > 0)
-                        .collect::<Vec<_>>(),
-                )
-                .chain(once(shard_chips.iter().map(Chip::width).collect())),
-            )
+            .zip_eq(round_widths)
             // The jagged verifier has already checked that `a.len()>=2`, so this indexing is safe.
             .all(|(a, b)| a[..a.len() - 2].iter().map(|(_, c)| *c).collect::<Vec<_>>() == b)
         {
@@ -760,37 +838,8 @@ where
             fri_config,
             log_stacking_height,
             max_log_row_count,
-            NUM_SP1_COMMITMENTS,
+            machine.num_commitment_rounds(),
         );
         Self { jagged_pcs_verifier: pcs_verifier, machine }
-    }
-}
-
-impl<GC: IopCtx<F: TwoAdicField, EF: TwoAdicField>, A>
-    ShardVerifier<GC, ShardContextImpl<GC, Verifier<GC>, A>>
-where
-    A: ZerocheckAir<GC::F, GC::EF>,
-    GC::F: PrimeField32,
-{
-    /// Create a shard verifier from basefold parameters.
-    #[must_use]
-    pub fn from_config(
-        config: &WhirProofShape<GC::F>,
-        max_log_row_count: usize,
-        machine: Machine<GC::F, A>,
-        num_expected_commitments: usize,
-        challenger: &mut GC::Challenger,
-    ) -> Self {
-        let merkle_verifier = MerkleTreeTcs::default();
-        let verifier = Verifier::<GC>::new(
-            merkle_verifier,
-            config.clone(),
-            num_expected_commitments,
-            challenger,
-        );
-
-        let jagged_verifier =
-            JaggedPcsVerifier::<GC, Verifier<GC>>::new(verifier, max_log_row_count);
-        Self { jagged_pcs_verifier: jagged_verifier, machine }
     }
 }

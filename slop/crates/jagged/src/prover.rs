@@ -1,58 +1,50 @@
 use serde::{Deserialize, Serialize};
 
+use slop_stacked::{StackedEvalClaim, StackedPcsProver, StackedProverData};
 use slop_utils::log2_ceil_usize;
 use std::{fmt::Debug, iter::once, sync::Arc};
 
 use slop_algebra::AbstractField;
-use slop_alloc::{mem::CopyError, Buffer, CpuBackend, HasBackend};
+use slop_alloc::{mem::CopyError, Buffer, HasBackend};
 use slop_challenger::{FieldChallenger, IopCtx};
 use slop_commit::{Message, Rounds};
 use slop_multilinear::{
-    Evaluations, Mle, MultilinearPcsProver, MultilinearPcsVerifier, PaddedMle, Point, ToMle,
+    BatchPcsProver, BatchPcsVerifier, Evaluations, Mle, PaddedMle, Point, ToMle,
 };
 use slop_sumcheck::reduce_sumcheck_to_evaluation;
 use slop_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use thiserror::Error;
 
 use crate::{
-    sumcheck::jagged_sumcheck_poly, JaggedAssistSumAsPolyCPUImpl, JaggedEvalProver,
-    JaggedEvalSumcheckProver, JaggedLittlePolynomialProverParams, JaggedPcsProof,
-    JaggedPcsVerifier,
+    sumcheck::jagged_sumcheck_poly, JaggedEvalSumcheckProver, JaggedLittlePolynomialProverParams,
+    JaggedPcsProof, JaggedPcsVerifier,
 };
 
-pub type JaggedAssistProver<GC> = JaggedEvalSumcheckProver<
-    <GC as IopCtx>::F,
-    JaggedAssistSumAsPolyCPUImpl<<GC as IopCtx>::F, <GC as IopCtx>::EF, <GC as IopCtx>::Challenger>,
-    CpuBackend,
-    <GC as IopCtx>::Challenger,
->;
+pub type JaggedAssistProver<GC> =
+    JaggedEvalSumcheckProver<<GC as IopCtx>::F, <GC as IopCtx>::EF, <GC as IopCtx>::Challenger>;
 
 /// Result type for `commit_multilinears`.
-pub type CommitMultilinearsResult<GC, C, Proof> = Result<
-    (
-        <GC as IopCtx>::Digest,
-        JaggedProverData<GC, <C as MultilinearPcsProver<GC, Proof>>::ProverData>,
-    ),
-    JaggedProverError<<C as MultilinearPcsProver<GC, Proof>>::ProverError>,
+pub type CommitMultilinearsResult<GC, C> = Result<
+    (<GC as IopCtx>::Digest, JaggedProverData<GC, <C as BatchPcsProver<GC>>::ProverData>),
+    JaggedProverError<<C as BatchPcsProver<GC>>::ProverError>,
 >;
 
 /// Result type for `prove_trusted_evaluations`.
-pub type ProveTrustedEvaluationsResult<GC, C, Proof> = Result<
-    JaggedPcsProof<GC, Proof>,
-    JaggedProverError<<C as MultilinearPcsProver<GC, Proof>>::ProverError>,
+pub type ProveTrustedEvaluationsResult<GC, C> = Result<
+    JaggedPcsProof<GC, <C as BatchPcsProver<GC>>::Proof>,
+    JaggedProverError<<C as BatchPcsProver<GC>>::ProverError>,
 >;
 
 #[derive(Clone)]
-pub struct JaggedProver<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> {
-    pub pcs_prover: C,
+pub struct JaggedProver<GC: IopCtx, C> {
+    pub pcs_prover: StackedPcsProver<C, GC>,
     jagged_eval_prover: JaggedAssistProver<GC>,
     pub max_log_row_count: usize,
-    _marker: std::marker::PhantomData<Proof>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JaggedProverData<GC: IopCtx, ProverData> {
-    pub pcs_prover_data: ProverData,
+    pub pcs_prover_data: StackedProverData<Mle<GC::F>, ProverData>,
     pub row_counts: Arc<Vec<usize>>,
     pub column_counts: Arc<Vec<usize>>,
     /// The number of columns added as a result of padding in the undedrlying stacked PCS.
@@ -68,31 +60,24 @@ pub enum JaggedProverError<Error> {
     CopyError(#[from] CopyError),
 }
 
-pub trait DefaultJaggedProver<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>>:
-    MultilinearPcsProver<GC, Verifier::Proof> + Sized
+pub trait DefaultJaggedProver<GC: IopCtx, Verifier: BatchPcsVerifier<GC>>:
+    BatchPcsProver<GC, Proof = <Verifier as BatchPcsVerifier<GC>>::Proof> + Sized
 {
-    fn prover_from_verifier(
-        verifier: &JaggedPcsVerifier<GC, Verifier>,
-    ) -> JaggedProver<GC, Verifier::Proof, Self>;
+    fn prover_from_verifier(verifier: &JaggedPcsVerifier<GC, Verifier>) -> JaggedProver<GC, Self>;
 }
 
-impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Proof, C> {
+impl<GC: IopCtx, C: BatchPcsProver<GC>> JaggedProver<GC, C> {
     pub const fn new(
         max_log_row_count: usize,
-        pcs_prover: C,
+        pcs_prover: StackedPcsProver<C, GC>,
         jagged_eval_prover: JaggedAssistProver<GC>,
     ) -> Self {
-        Self {
-            pcs_prover,
-            jagged_eval_prover,
-            max_log_row_count,
-            _marker: std::marker::PhantomData,
-        }
+        Self { pcs_prover, jagged_eval_prover, max_log_row_count }
     }
 
     pub fn from_verifier<Verifier>(verifier: &JaggedPcsVerifier<GC, Verifier>) -> Self
     where
-        Verifier: MultilinearPcsVerifier<GC, Proof = Proof>,
+        Verifier: BatchPcsVerifier<GC>,
         C: DefaultJaggedProver<GC, Verifier>,
     {
         C::prover_from_verifier(verifier)
@@ -106,7 +91,7 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
     pub fn commit_multilinears(
         &self,
         multilinears: Vec<PaddedMle<GC::F>>,
-    ) -> CommitMultilinearsResult<GC, C, Proof> {
+    ) -> CommitMultilinearsResult<GC, C> {
         let mut row_counts = multilinears.iter().map(|x| x.num_real_entries()).collect::<Vec<_>>();
         let mut column_counts =
             multilinears.iter().map(|x| x.num_polynomials()).collect::<Vec<_>>();
@@ -129,7 +114,7 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
             multilinears.into_iter().filter_map(|mle| mle.into_inner()).collect::<Message<_>>();
 
         let (commitment, data, num_added_vals) =
-            self.pcs_prover.commit_multilinear(message).unwrap();
+            self.pcs_prover.commit_multilinears(message).unwrap();
 
         let num_added_cols = num_added_vals.div_ceil(1 << self.max_log_row_count).max(1);
 
@@ -163,11 +148,9 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
         &self,
         eval_point: Point<GC::EF>,
         evaluation_claims: Rounds<Evaluations<GC::EF>>,
-        prover_data: Rounds<
-            JaggedProverData<GC, <C as MultilinearPcsProver<GC, Proof>>::ProverData>,
-        >,
+        prover_data: Rounds<JaggedProverData<GC, C::ProverData>>,
         challenger: &mut GC::Challenger,
-    ) -> ProveTrustedEvaluationsResult<GC, C, Proof> {
+    ) -> ProveTrustedEvaluationsResult<GC, C> {
         let num_col_variables = prover_data
             .iter()
             .map(|data| data.column_counts.iter().sum::<usize>())
@@ -249,7 +232,7 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
                 &params,
                 row_data,
                 column_data,
-                self.pcs_prover.log_max_padding_amount(),
+                self.pcs_prover.log_stacking_height(),
                 &z_row_backend,
                 &z_col_backend,
             )
@@ -281,9 +264,71 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
                 &z_col,
                 &final_eval_point,
                 challenger,
-                backend,
             )
         };
+
+        // Booleanity-batched sumcheck: reduces the 64 (curr + next) bit-MLE
+        // evaluation claims at the two-stage GKR's stage-2 point η to 32
+        // curr-bit claims at a fresh point `z_new`, and proves Booleanity
+        // of the 32 curr-bit MLEs.  Must follow `prove_jagged_evaluation`'s
+        // challenger state so the verifier's FS matches.
+        let boolean_batched_proof = {
+            use crate::jagged_assist::{BooleanityBatched, NUM_BITS, PREFIX_SUM_BITS};
+            use slop_multilinear::Mle;
+
+            let _span = tracing::debug_span!("boolean-batched sumcheck").entered();
+            debug_assert_eq!(NUM_BITS, PREFIX_SUM_BITS);
+
+            // η + 64 final_evals come straight out of the two-stage proof.
+            let two_stage = &jagged_eval_proof.two_stage_proof;
+            let eta: Point<GC::EF> = two_stage.stage2.point_and_eval.0.clone();
+
+            // Build the 32 curr-bit MLEs at full 2^c column-cube size.
+            let c = num_col_variables as usize;
+            let two_c = 1usize << c;
+            let prefix_sums = &params.col_prefix_sums_usize;
+            let num_real_cols = prefix_sums.len() - 1;
+            let max_prefix_sum = *prefix_sums.last().unwrap();
+            use rayon::prelude::*;
+            let curr_bits: Vec<Mle<GC::F>> = (0..NUM_BITS)
+                .into_par_iter()
+                .map(|b| {
+                    let table: Vec<GC::F> = (0..two_c)
+                        .map(|col| {
+                            if col < num_real_cols && ((prefix_sums[col] >> b) & 1) == 1 {
+                                GC::F::one()
+                            } else {
+                                GC::F::zero()
+                            }
+                        })
+                        .collect();
+                    Mle::from(table)
+                })
+                .collect();
+
+            // α (per-bit batch of 3 claims) + ρ_bit (5-dim cross-bit RLC
+            // point) drawn after the two-stage GKR's challenger state is
+            // fully consumed.  The eq(ρ_bit, b) weights align the booleanity
+            // sumcheck's final-eval claim with the (z_new, ρ_bit) point on
+            // the combined [NUM_BITS, 2^c] bits MLE — i.e., the eval claim
+            // we feed into the downstream 2-to-1 reduction.
+            use crate::jagged_assist::LOG_NUM_BITS;
+            let alpha: GC::EF = challenger.sample_ext_element();
+            let rho_bit: Point<GC::EF> = (0..LOG_NUM_BITS)
+                .map(|_| challenger.sample_ext_element())
+                .collect::<Vec<_>>()
+                .into();
+
+            BooleanityBatched::new(num_real_cols, max_prefix_sum).prove::<GC::F, GC::EF, _>(
+                &eta,
+                &curr_bits,
+                &two_stage.final_evals,
+                alpha,
+                &rho_bit,
+                challenger,
+            )
+        };
+
         let (row_counts, column_counts): (Rounds<_>, Rounds<_>) = prover_data
             .iter()
             .map(|data| {
@@ -299,13 +344,13 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
 
         let pcs_proof = {
             let _span = tracing::debug_span!("Dense PCS evaluation proof").entered();
+            let claim = StackedEvalClaim {
+                round_areas: self.pcs_prover.round_areas(&stacked_prover_data),
+                point: final_eval_point,
+                evaluation: component_poly_evals[0][0],
+            };
             self.pcs_prover
-                .prove_untrusted_evaluation(
-                    final_eval_point,
-                    component_poly_evals[0][0],
-                    stacked_prover_data,
-                    challenger,
-                )
+                .prove_untrusted_evaluation(&claim, stacked_prover_data, challenger)
                 .unwrap()
         };
 
@@ -319,6 +364,7 @@ impl<GC: IopCtx, Proof, C: MultilinearPcsProver<GC, Proof>> JaggedProver<GC, Pro
             pcs_proof,
             sumcheck_proof,
             jagged_eval_proof,
+            boolean_batched_proof,
             row_counts_and_column_counts,
             merkle_tree_commitments: original_commitments,
             expected_eval: component_poly_evals[0][0],

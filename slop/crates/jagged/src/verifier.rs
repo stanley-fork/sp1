@@ -1,23 +1,34 @@
 use crate::{
     JaggedEvalSumcheckConfig, JaggedLittlePolynomialVerifierParams, JaggedSumcheckEvalProof,
 };
+use derive_where::derive_where;
 use itertools::{izip, Itertools};
-use serde::{Deserialize, Serialize};
 use slop_algebra::{AbstractField, PrimeField32};
 use slop_challenger::{FieldChallenger, IopCtx};
 use slop_commit::Rounds;
-use slop_multilinear::{full_geq, Mle, MleEval, MultilinearPcsVerifier, Point};
+use slop_multilinear::{BatchPcsVerifier, Mle, MleEval, Point};
+use slop_stacked::{
+    EqBatchedVerifierError, StackedEvalClaim, StackedPcsVerifier, StackedProof,
+    StackedVerifierError,
+};
 use slop_sumcheck::{partially_verify_sumcheck_proof, PartialSumcheckProof, SumcheckError};
 use slop_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 use slop_utils::log2_ceil_usize;
 use std::{fmt::Debug, iter::once};
 use thiserror::Error;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive_where(Clone, Serialize, Deserialize; StackedProof<GC, Proof>)]
 pub struct JaggedPcsProof<GC: IopCtx, Proof> {
-    pub pcs_proof: Proof,
+    pub pcs_proof: StackedProof<GC, Proof>,
     pub sumcheck_proof: PartialSumcheckProof<GC::EF>,
     pub jagged_eval_proof: JaggedSumcheckEvalProof<GC::EF>,
+    /// Booleanity-batched sumcheck reducing the 64 (curr + next) two-stage
+    /// final evals to 32 curr-only evaluation claims at a new point `z_new`
+    /// and proving Booleanity of the 32 curr-bit MLEs.  The 32 final claims
+    /// will eventually be discharged by PCS openings on the curr-bit
+    /// multilinears committed at jagged commit time (out of scope for this
+    /// PR — currently the claims are exposed but unchecked downstream).
+    pub boolean_batched_proof: crate::jagged_assist::BooleanityBatchedProof<GC::EF>,
     pub row_counts_and_column_counts: Rounds<Vec<(usize, usize)>>,
     pub merkle_tree_commitments: Rounds<GC::Digest>,
     pub expected_eval: GC::EF,
@@ -25,16 +36,20 @@ pub struct JaggedPcsProof<GC: IopCtx, Proof> {
     pub log_m: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct JaggedPcsVerifier<GC, C> {
-    pub pcs_verifier: C,
+    pub stacked_pcs_verifier: StackedPcsVerifier<GC, C>,
     pub max_log_row_count: usize,
     _marker: std::marker::PhantomData<GC>,
 }
 
 impl<GC, C> JaggedPcsVerifier<GC, C> {
-    pub fn new(pcs_verifier: C, max_log_row_count: usize) -> Self {
-        Self { pcs_verifier, max_log_row_count, _marker: std::marker::PhantomData }
+    pub fn new(pcs_verifier: StackedPcsVerifier<GC, C>, max_log_row_count: usize) -> Self {
+        Self {
+            stacked_pcs_verifier: pcs_verifier,
+            max_log_row_count,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 
@@ -47,7 +62,7 @@ pub enum JaggedPcsVerifierError<EF, PcsError> {
     #[error("jagged evaluation proof verification failed")]
     JaggedEvalProofVerificationFailed,
     #[error("dense pcs verification failed: {0}")]
-    DensePcsVerificationFailed(#[from] PcsError),
+    DensePcsVerificationFailed(#[from] StackedVerifierError<EqBatchedVerifierError<PcsError>>),
     #[error("booleanity check failed")]
     BooleanityCheckFailed,
     #[error("montonicity check failed")]
@@ -101,9 +116,18 @@ pub fn unzip_and_prefix_sums(
     PrefixSumsMaxLogRowCount { row_counts, column_counts, usize_prefix_sums, log_m: log_trace }
 }
 
-impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Verifier> {
+type JaggedVerifyResult<GC, Verifier> = Result<
+    (),
+    JaggedPcsVerifierError<<GC as IopCtx>::EF, <Verifier as BatchPcsVerifier<GC>>::VerifierError>,
+>;
+
+impl<GC: IopCtx, Verifier: BatchPcsVerifier<GC>> JaggedPcsVerifier<GC, Verifier> {
     pub fn challenger(&self) -> GC::Challenger {
         GC::default_challenger()
+    }
+
+    pub fn num_expected_commitments(&self) -> usize {
+        self.stacked_pcs_verifier.inner_verifier.inner.num_expected_commitments()
     }
 
     pub fn verify_trusted_evaluations(
@@ -113,11 +137,12 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
         evaluation_claims: &[MleEval<GC::EF>],
         proof: &JaggedPcsProof<GC, Verifier::Proof>,
         challenger: &mut GC::Challenger,
-    ) -> Result<(), JaggedPcsVerifierError<GC::EF, Verifier::VerifierError>> {
+    ) -> JaggedVerifyResult<GC, Verifier> {
         let JaggedPcsProof {
             pcs_proof,
             sumcheck_proof,
             jagged_eval_proof,
+            boolean_batched_proof,
             row_counts_and_column_counts,
             merkle_tree_commitments: original_commitments,
             expected_eval,
@@ -158,11 +183,11 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
         // Collect the claims for the different polynomials.
         let mut column_claims = evaluation_claims.iter().flatten().copied().collect::<Vec<_>>();
 
-        if commitments.len() != self.pcs_verifier.num_expected_commitments()
-            || evaluation_claims.len() != self.pcs_verifier.num_expected_commitments()
-            || row_counts.len() != self.pcs_verifier.num_expected_commitments()
-            || column_counts.len() != self.pcs_verifier.num_expected_commitments()
-            || original_commitments.len() != self.pcs_verifier.num_expected_commitments()
+        if commitments.len() != self.num_expected_commitments()
+            || evaluation_claims.len() != self.num_expected_commitments()
+            || row_counts.len() != self.num_expected_commitments()
+            || column_counts.len() != self.num_expected_commitments()
+            || original_commitments.len() != self.num_expected_commitments()
         {
             return Err(JaggedPcsVerifierError::IncorrectShape);
         }
@@ -244,7 +269,7 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
             .iter()
             .map(|area| {
                 let next_multiple = area.next_multiple_of(
-                    1 << Verifier::log_stacking_height(&self.pcs_verifier) as usize,
+                    1 << self.stacked_pcs_verifier.log_stacking_height() as usize,
                 );
                 // No underflow because `next_multiple>=area`.
                 let added_vals = next_multiple - area;
@@ -338,15 +363,15 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
             if t_col.len() != next_t_col.len() || t_col.len() >= 31 || t_col.is_empty() {
                 return Err(JaggedPcsVerifierError::IncorrectShape);
             }
-            // Check monotonicity of the column prefix sums.
-            if full_geq(t_col, next_t_col) != GC::F::one() {
-                return Err(JaggedPcsVerifierError::MonotonicityCheckFailed);
-            }
         }
+        // Monotonicity is now enforced inside `JaggedEvalSumcheckConfig::jagged_evaluation`
+        // by the fused (assist + alpha * geq) sumcheck — if any consecutive pair were
+        // non-monotone, the BP reconciliation against the prover's claimed eval would
+        // fail.
 
         let params = JaggedLittlePolynomialVerifierParams { col_prefix_sums: point_prefix_sums };
 
-        let jagged_eval = JaggedEvalSumcheckConfig::jagged_evaluation(
+        let (jagged_eval, eta, final_evals) = JaggedEvalSumcheckConfig::jagged_evaluation(
             &params,
             &z_row,
             &z_col,
@@ -361,6 +386,78 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
             return Err(JaggedPcsVerifierError::JaggedEvalProofVerificationFailed);
         }
 
+        // Booleanity-batched sumcheck: reduces the 64 (curr + next) two-stage
+        // final evals at η to a single combined claim at the c+5-dim point
+        // `(z_new, ρ_bit)` on the `[NUM_BITS, 2^c]` curr-bit MLE.  The
+        // curr-bit MLE is *deterministic* — it's bit `b` of
+        // `usize_prefix_sums[col]` at cell `(b, col)`, with zeros beyond
+        // `num_real_cols` — so the verifier can re-evaluate it from the
+        // public prefix sums (already reconstructed above) and compare
+        // against `p_claim`.  This in-line check stands in for the PCS
+        // openings on the committed curr-bit MLEs that would otherwise
+        // discharge the claim, which is sound because the bit MLE is
+        // verifier-known.
+        {
+            use crate::jagged_assist::{BooleanityBatched, NUM_BITS};
+            use slop_multilinear::partial_lagrange_blocking;
+
+            let num_real_cols = usize_prefix_sums.len() - 1;
+            let max_prefix_sum = *usize_prefix_sums.last().unwrap();
+
+            use crate::jagged_assist::LOG_NUM_BITS;
+            let alpha: GC::EF = challenger.sample_ext_element();
+            let rho_bit: Point<GC::EF> = (0..LOG_NUM_BITS)
+                .map(|_| challenger.sample_ext_element())
+                .collect::<Vec<_>>()
+                .into();
+
+            let (combined_point, p_claim) = BooleanityBatched::new(num_real_cols, max_prefix_sum)
+                .verify::<GC::F, GC::EF, _>(
+                    boolean_batched_proof,
+                    &eta,
+                    &final_evals,
+                    alpha,
+                    &rho_bit,
+                    challenger,
+                )
+                .map_err(|_| JaggedPcsVerifierError::JaggedEvalProofVerificationFailed)?;
+
+            // Recompute the bit-MLE eval at (z_new, ρ_bit):
+            //   Σ_{col<num_real_cols} eq(z_new, col)
+            //     · Σ_{b<NUM_BITS} eq(ρ_bit, b) · bit_b(usize_prefix_sums[col])
+            // and compare to the prover-claimed `p_claim`.
+            //
+            // `combined_point = z_new ⧺ ρ_bit`, so we use the c-prefix as
+            // `z_new` (`c = num_col_variables`).  Mirrors the DEBUG-gated
+            // check at jagged_assist/assist_verifier.rs:161-179 but on the
+            // non-merged curr-bit MLE produced by the boolean-batched
+            // sumcheck.
+            let c = num_col_variables as usize;
+            debug_assert_eq!(combined_point.dimension(), c + LOG_NUM_BITS);
+            let (z_new, _rho_bit_suffix) = combined_point.split_at(c);
+
+            let eq_z_new = partial_lagrange_blocking(&z_new);
+            let eq_z_new_slice = eq_z_new.as_buffer().as_slice();
+            let eq_rho = slop_multilinear::Mle::<GC::EF>::blocking_partial_lagrange(&rho_bit);
+            let eq_rho_slice = eq_rho.guts().as_slice();
+
+            let mut expected_p_claim = <GC::EF as AbstractField>::zero();
+            for col in 0..num_real_cols {
+                let ps = usize_prefix_sums[col] as u32;
+                let mut bit_contribution = <GC::EF as AbstractField>::zero();
+                for (b, rho_bit) in eq_rho_slice.iter().take(NUM_BITS).enumerate() {
+                    if (ps >> b) & 1 == 1 {
+                        bit_contribution += *rho_bit;
+                    }
+                }
+                expected_p_claim += eq_z_new_slice[col] * bit_contribution;
+            }
+
+            if expected_p_claim != p_claim {
+                return Err(JaggedPcsVerifierError::JaggedEvalProofVerificationFailed);
+            }
+        }
+
         let mut total_areas = round_areas.clone();
         for (prev_area, (num_added_evals, _)) in
             total_areas.iter_mut().zip_eq(expected_added_vals_and_cols.iter())
@@ -369,13 +466,15 @@ impl<GC: IopCtx, Verifier: MultilinearPcsVerifier<GC>> JaggedPcsVerifier<GC, Ver
         }
 
         // Verify the evaluation proof using the (dense) stacked PCS verifier.
-        let evaluation_point = sumcheck_proof.point_and_eval.0.clone();
-        self.pcs_verifier
+        let claim = StackedEvalClaim {
+            round_areas: total_areas,
+            point: sumcheck_proof.point_and_eval.0.clone(),
+            evaluation: *expected_eval,
+        };
+        self.stacked_pcs_verifier
             .verify_untrusted_evaluation(
                 proof.merkle_tree_commitments.as_slice(),
-                &total_areas,
-                evaluation_point,
-                *expected_eval,
+                &claim,
                 pcs_proof,
                 challenger,
             )

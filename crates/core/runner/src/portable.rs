@@ -4,7 +4,7 @@ use sp1_core_executor::{
     with_output_consumers, ExecutionError, MinimalExecutorEnum, OutputConsumers, Program,
     UnsafeMemory, DEFAULT_MEMORY_LIMIT,
 };
-use sp1_jit::{MemValue, TraceChunkRaw};
+use sp1_jit::{DirtyPages, MemValue, TraceChunkRaw};
 use std::sync::Arc;
 
 /// Minimal trace portable executor that caps memory entries
@@ -43,6 +43,24 @@ impl MinimalExecutorRunner {
             ),
             output_consumers: OutputConsumers::default(),
         }
+    }
+
+    /// API-compatible stub matching [`super::native::MinimalExecutorRunner::new_with_dirty_pages`].
+    /// The portable executor does not produce a [`DirtyPages`] payload per chunk; the
+    /// `_dirty_pages_slot_bytes` argument is accepted and ignored so callers
+    /// (e.g. the prover controller) can use the same construction shape on
+    /// either backend.
+    #[must_use]
+    #[inline]
+    pub fn new_with_dirty_pages(
+        program: Arc<Program>,
+        is_debug: bool,
+        max_trace_size: Option<u64>,
+        memory_limit: u64,
+        shm_slot_size: usize,
+        _dirty_pages_slot_bytes: Option<usize>,
+    ) -> Self {
+        Self::new(program, is_debug, max_trace_size, memory_limit, shm_slot_size)
     }
 
     /// Redirect guest output to the configured channels.
@@ -95,6 +113,20 @@ impl MinimalExecutorRunner {
     pub fn try_execute_chunk(&mut self) -> Result<Option<TraceChunkRaw>, ExecutionError> {
         let consumers = self.output_consumers.clone();
         with_output_consumers(&consumers, || self.inner.try_execute_chunk())
+    }
+
+    /// Execute the next chunk and pair it with the chunk's dirty pages.
+    #[inline]
+    pub fn try_execute_chunk_with_dirty_pages(
+        &mut self,
+    ) -> Result<Option<(TraceChunkRaw, DirtyPages)>, ExecutionError> {
+        match self.try_execute_chunk()? {
+            Some(chunk) => {
+                let dirty = self.inner.emit_dirty_pages();
+                Ok(Some((chunk, dirty)))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Get the registers of the JIT function.

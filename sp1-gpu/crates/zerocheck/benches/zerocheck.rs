@@ -17,6 +17,7 @@ use sp1_gpu_cudart::TaskScope;
 use sp1_gpu_jagged_tracegen::test_utils::bench_utils::{
     with_trace_source, FullKind, RealTraceData,
 };
+use sp1_gpu_jagged_tracegen::test_utils::tracegen_setup::CORE_MAX_LOG_ROW_COUNT;
 use sp1_gpu_utils::{Ext, Felt, TestGC};
 use sp1_gpu_zerocheck::primitives::evaluate_jagged_columns;
 use sp1_gpu_zerocheck::prover::{upload_machine_bytecode, zerocheck};
@@ -71,17 +72,14 @@ fn run_zerocheck<R: Rng>(
         let main_width = chip.width();
 
         let chip_eval = ChipEvaluation {
-            preprocessed_trace_evaluations: match preprocessed_width {
-                0 => None,
-                _ => Some(MleEval::new(Tensor::from(
-                    individual_column_evals
-                        [preprocessed_ptr..preprocessed_ptr + preprocessed_width]
-                        .to_vec(),
-                ))),
-            },
+            preprocessed_trace_evaluations: MleEval::new(Tensor::from(
+                individual_column_evals[preprocessed_ptr..preprocessed_ptr + preprocessed_width]
+                    .to_vec(),
+            )),
             main_trace_evaluations: MleEval::new(Tensor::from(
                 individual_column_evals[main_ptr..main_ptr + main_width].to_vec(),
             )),
+            global_trace_evaluations: MleEval::from(Vec::new()),
         };
 
         chip_openings.insert(chip.air.name().to_string(), chip_eval);
@@ -123,7 +121,7 @@ fn run_zerocheck<R: Rng>(
 
 fn bench_zerocheck(c: &mut Criterion) {
     let mut rng = StdRng::seed_from_u64(42);
-    with_trace_source(c, &mut rng, FullKind, |c, id, scope, rng, data| {
+    with_trace_source(c, &mut rng, FullKind, CORE_MAX_LOG_ROW_COUNT, |c, id, scope, rng, data| {
         run_zerocheck(c, id, scope, rng, data);
     });
 }

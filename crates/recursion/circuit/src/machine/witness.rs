@@ -89,16 +89,18 @@ impl Witnessable<InnerConfig> for SP1NormalizeWitnessValues<SP1GlobalContext, SP
         let vk = self.vk.read(builder);
         let shard_proofs = self.shard_proofs.read(builder);
         let reconstruct_deferred_digest = self.reconstruct_deferred_digest.read(builder);
-        let is_complete = InnerVal::from_bool(self.is_complete).read(builder);
         let vk_root = self.vk_root.read(builder);
         let num_deferred_proofs = self.num_deferred_proofs.read(builder);
+        let commitments_hash = self.commitments_hash.read(builder);
+        let prev_hasher_state = self.prev_hasher_state.read(builder);
         SP1RecursionWitnessVariable {
             vk,
             shard_proofs,
-            is_complete,
             reconstruct_deferred_digest,
             vk_root,
             num_deferred_proofs,
+            commitments_hash,
+            prev_hasher_state,
         }
     }
 
@@ -106,9 +108,10 @@ impl Witnessable<InnerConfig> for SP1NormalizeWitnessValues<SP1GlobalContext, SP
         self.vk.write(witness);
         self.shard_proofs.write(witness);
         self.reconstruct_deferred_digest.write(witness);
-        self.is_complete.write(witness);
         self.vk_root.write(witness);
         self.num_deferred_proofs.write(witness);
+        self.commitments_hash.write(witness);
+        self.prev_hasher_state.write(witness);
     }
 }
 
@@ -146,6 +149,7 @@ where
             self.start_reconstruct_deferred_digest.read(builder);
         let sp1_vk_digest = self.sp1_vk_digest.read(builder);
         let end_pc = self.end_pc.read(builder);
+        let initial_memory_root = self.initial_memory_root.read(builder);
         let proof_nonce = self.proof_nonce.read(builder);
         let deferred_proof_index = self.deferred_proof_index.read(builder);
 
@@ -155,6 +159,7 @@ where
             start_reconstruct_deferred_digest,
             sp1_vk_digest,
             end_pc,
+            initial_memory_root,
             proof_nonce,
             deferred_proof_index,
         }
@@ -166,6 +171,7 @@ where
         self.start_reconstruct_deferred_digest.write(witness);
         self.sp1_vk_digest.write(witness);
         self.end_pc.write(witness);
+        self.initial_memory_root.write(witness);
         self.proof_nonce.write(witness);
         self.deferred_proof_index.write(witness);
     }

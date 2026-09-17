@@ -1,10 +1,7 @@
 use itertools::Itertools;
 use slop_algebra::AbstractField;
 use sp1_primitives::SP1Field;
-use sp1_recursion_compiler::{
-    circuit::CircuitV2Builder,
-    ir::{Builder, Config, Felt},
-};
+use sp1_recursion_compiler::ir::{Builder, Config, Felt};
 use sp1_recursion_executor::RecursionPublicValues;
 
 /// Assertions on recursion public values which represent a complete proof.
@@ -22,17 +19,10 @@ pub(crate) fn assert_complete<C: Config>(
         deferred_proofs_digest,
         prev_exit_code,
         next_pc,
-        initial_timestamp,
         start_reconstruct_deferred_digest,
         end_reconstruct_deferred_digest,
-        global_cumulative_sum,
         contains_first_shard,
-        previous_init_addr,
-        last_init_addr,
-        previous_finalize_addr,
-        last_finalize_addr,
-        previous_init_page_idx,
-        previous_finalize_page_idx,
+        prev_chunk_index,
         prev_commit_syscall,
         commit_syscall,
         prev_commit_deferred_syscall,
@@ -68,49 +58,6 @@ pub(crate) fn assert_complete<C: Config>(
     builder
         .assert_felt_eq(is_complete * (*contains_first_shard - SP1Field::one()), SP1Field::zero());
 
-    // Assert that the initial timestamp is equal to 1.
-    for limb in initial_timestamp[0..3].iter() {
-        builder.assert_felt_eq(is_complete * *limb, SP1Field::zero());
-    }
-    builder
-        .assert_felt_eq(is_complete * (initial_timestamp[3] - SP1Field::one()), SP1Field::zero());
-
-    // Assert that the `previous_init_addr` is 0.
-    for limb in previous_init_addr.iter() {
-        builder.assert_felt_eq(is_complete * *limb, SP1Field::zero());
-    }
-
-    // Assert that the `last_init_addr` is not 0.
-    // SAFETY: `last_init_addr` are with valid u16 limbs, as it's checked in each core shard.
-    // If `is_complete = 0`, then the right hand side is `p - 1`, which cannot equal sum of three
-    // u16 limbs due to the size of `p`. If `is_complete = 1`, then the right hand side is `0`, so
-    // this constrains that `last_init_addr` cannot be identical to `0`.
-    builder.assert_felt_ne(
-        last_init_addr[0] + last_init_addr[1] + last_init_addr[2],
-        is_complete - SP1Field::one(),
-    );
-
-    // Assert that the `previous_finalize_addr` is 0.
-    for limb in previous_finalize_addr.iter() {
-        builder.assert_felt_eq(is_complete * *limb, SP1Field::zero());
-    }
-
-    // Assert that the `last_finalize_addr` is not 0. Same method as `last_init_addr`.
-    builder.assert_felt_ne(
-        last_finalize_addr[0] + last_finalize_addr[1] + last_finalize_addr[2],
-        is_complete - SP1Field::one(),
-    );
-
-    // Assert that the `previous_init_page_idx` is 0.
-    for limb in previous_init_page_idx.iter() {
-        builder.assert_felt_eq(is_complete * *limb, SP1Field::zero());
-    }
-
-    // Assert that the `previous_finalize_page_idx` is 0.
-    for limb in previous_finalize_page_idx.iter() {
-        builder.assert_felt_eq(is_complete * *limb, SP1Field::zero());
-    }
-
     // The start reconstruct deferred digest should be zero.
     for start_digest in start_reconstruct_deferred_digest {
         builder.assert_felt_eq(is_complete * *start_digest, SP1Field::zero());
@@ -124,6 +71,9 @@ pub(crate) fn assert_complete<C: Config>(
     }
     // The initial deferred proof index should be equal to zero
     builder.assert_felt_eq(is_complete * *prev_deferred_proof, SP1Field::zero());
+
+    // The initial chunk index should be equal to zero.
+    builder.assert_felt_eq(is_complete * *prev_chunk_index, SP1Field::zero());
 
     // Assert that the starting `prev_exit_code` is equal to 0.
     builder.assert_felt_eq(is_complete * *prev_exit_code, SP1Field::zero());
@@ -142,7 +92,68 @@ pub(crate) fn assert_complete<C: Config>(
         is_complete * (*commit_deferred_syscall - SP1Field::one()),
         SP1Field::zero(),
     );
+}
 
-    // The global cumulative sum should sum be equal to the zero digest.
-    builder.assert_digest_zero_v2(is_complete, *global_cumulative_sum);
+/// Assertions on recursion public values which represent a complete chunk (a chunk root).
+///
+/// When `is_chunk_complete == 1`, the chunk's global interactions must balance and the witnessed
+/// commitments hash must equal the finalized reconstructed challenge sponge.
+pub(crate) fn assert_chunk_complete<C: Config>(
+    builder: &mut Builder<C>,
+    public_values: &RecursionPublicValues<Felt<SP1Field>>,
+    is_chunk_complete: Felt<SP1Field>,
+) {
+    let RecursionPublicValues {
+        global_cumulative_sum,
+        global_commitments_hash,
+        start_reconstruct_global_challenge,
+        end_reconstruct_global_challenge,
+        initial_timestamp,
+        prev_shard_index,
+        last_shard_index,
+        num_merkle_shard,
+        num_execution_shard,
+        ..
+    } = public_values;
+
+    // `is_chunk_complete` is boolean.
+    builder.assert_felt_eq(
+        is_chunk_complete * (is_chunk_complete - SP1Field::one()),
+        SP1Field::zero(),
+    );
+
+    // The chunk's global interactions balance under its shared challenge.
+    for limb in global_cumulative_sum {
+        builder.assert_felt_eq(is_chunk_complete * *limb, SP1Field::zero());
+    }
+
+    // The initial reconstruct of global challenge sponge is all zeroes.
+    for limb in start_reconstruct_global_challenge {
+        builder.assert_felt_eq(is_chunk_complete * *limb, SP1Field::zero());
+    }
+
+    // The witnessed `global_commitments_hash` equals the finalized reconstructed sponge.
+    for (hash_limb, state_limb) in
+        global_commitments_hash.iter().zip(end_reconstruct_global_challenge.iter())
+    {
+        builder.assert_felt_eq(is_chunk_complete * (*hash_limb - *state_limb), SP1Field::zero());
+    }
+
+    // The initial previous shard index must be 0.
+    builder.assert_felt_eq(is_chunk_complete * *prev_shard_index, SP1Field::zero());
+
+    // The last shard index should be `num_merkle_shard + num_execution_shard`.
+    builder.assert_felt_eq(
+        is_chunk_complete * (*last_shard_index - *num_merkle_shard - *num_execution_shard),
+        SP1Field::zero(),
+    );
+
+    // Assert that the initial timestamp is equal to 1.
+    for limb in initial_timestamp[0..3].iter() {
+        builder.assert_felt_eq(is_chunk_complete * *limb, SP1Field::zero());
+    }
+    builder.assert_felt_eq(
+        is_chunk_complete * (initial_timestamp[3] - SP1Field::one()),
+        SP1Field::zero(),
+    );
 }
